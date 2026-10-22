@@ -1,20 +1,21 @@
 """Test Contrastive White-Box Robustness on Unseen Olympiad Math Problems (AIME / IMO).
 
-Evaluates:
-1. Genuine unseen Olympiad problems across Algebra, Number Theory, Combinatorics, and Geometry.
-2. Meaning-preserving perturbation generation (x -> x').
-3. 27 structural & symbolic complexity features.
-4. Latent representation drift and cosine similarity (if GPU / model weights present).
-5. Calibrated robustness decisions: True (robust reasoning) vs False (fragile).
+Supports both:
+1. Pure offline mode with structural symbolic priors.
+2. Active GPU neural mode (--neural) measuring live Transformer hidden-state
+   drift, cosine similarity, and probe margin stability on CUDA.
 """
 
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 ROOT = Path(__file__).resolve().parents[1]
 SOLUTION_DIR = ROOT / "solutions" / "contrastive-whitebox"
@@ -23,10 +24,9 @@ if str(SOLUTION_DIR) not in sys.path:
 
 from contrastive.decision import predict_contrastive_robustness
 from contrastive.perturbation_engine import generate_contrastive_variant
-from contrastive.symbolic_extractor import extract_feature_dataframe, extract_symbolic_features
+from contrastive.symbolic_extractor import extract_feature_dataframe
 
 
-# Curated set of genuine AIME / Olympiad problems across all 4 math disciplines
 UNSEEN_OLYMPIAD_PROBLEMS = [
     {
         "id": "AIME-Algebra",
@@ -64,14 +64,21 @@ UNSEEN_OLYMPIAD_PROBLEMS = [
 ]
 
 
-def evaluate_unseen_olympiad():
+def evaluate_unseen_olympiad(model_name: str | None = None):
     print("=" * 80)
     print(" EVALUATING CONTRASTIVE WHITE-BOX DETECTOR ON UNSEEN OLYMPIAD PROBLEMS")
     print("=" * 80)
 
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Hardware Device: {device.upper()}")
+    if device == "cuda":
+        print(f"GPU Model:       {torch.cuda.get_device_name(0)}")
+        print(f"Total VRAM:      {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    print("-" * 80)
+
     problems = [item["problem"] for item in UNSEEN_OLYMPIAD_PROBLEMS]
 
-    # 1. Perturbation Engine Demo
+    # 1. Perturbation Engine
     print("\n[1] Meaning-Preserving Equivalence Perturbations (x -> x'):")
     print("-" * 80)
     for item in UNSEEN_OLYMPIAD_PROBLEMS:
@@ -80,17 +87,15 @@ def evaluate_unseen_olympiad():
         item["variant"] = variant
         print(f"[{item['id']} - {item['domain']}]")
         print(f"  Original:  {orig}")
-        print(f"  Variant:   {variant}")
-        print()
+        print(f"  Variant:   {variant}\n")
 
-    # 2. Symbolic Structural Feature Profiling
-    print("[2] Symbolic Structural Complexity Profiling (Selected Features):")
+    # 2. Symbolic Structural Complexity Profiling
+    print("[2] Symbolic Structural Complexity Profiling:")
     print("-" * 80)
     df_feats = extract_feature_dataframe(problems)
     summary_cols = [
         "char_count",
         "math_char_ratio",
-        "latex_command_count",
         "fraction_count",
         "distinct_variable_count",
         "max_number_magnitude",
@@ -103,17 +108,59 @@ def evaluate_unseen_olympiad():
     df_subset.insert(0, "Problem_ID", [item["id"] for item in UNSEEN_OLYMPIAD_PROBLEMS])
     print(df_subset.to_string(index=False))
 
-    # 3. Model Predictions via the Contrastive Solution Entrypoint
-    print("\n[3] Model Robustness Predictions:")
+    # 3. Active Neural GPU Forward Passes
+    if model_name:
+        print(f"\n[3] Active Neural GPU Inference on '{model_name}':")
+        print("-" * 80)
+        dtype = torch.float16 if device == "cuda" else torch.float32
+        print(f"Loading '{model_name}' onto {device.upper()}...")
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype).to(device)
+        model.eval()
+
+        print(f"\n{'Problem ID':<20} | {'Cosine Sim':<12} | {'Latent Drift':<14} | {'Neural Stability':<18}")
+        print("-" * 72)
+
+        neural_stabilities = []
+        for item in UNSEEN_OLYMPIAD_PROBLEMS:
+            inp_orig = tokenizer(item["problem"], return_tensors="pt").to(device)
+            inp_var = tokenizer(item["variant"], return_tensors="pt").to(device)
+
+            with torch.no_grad():
+                out_orig = model(**inp_orig, output_hidden_states=True, return_dict=True, use_cache=False)
+                out_var = model(**inp_var, output_hidden_states=True, return_dict=True, use_cache=False)
+
+            # Final layer hidden representation
+            v_orig = out_orig.hidden_states[-1][0, -1, :].detach().float().cpu().numpy()
+            v_var = out_var.hidden_states[-1][0, -1, :].detach().float().cpu().numpy()
+
+            norm_orig = np.linalg.norm(v_orig)
+            norm_var = np.linalg.norm(v_var)
+            cos_sim = float(np.dot(v_orig, v_var) / max(1e-8, (norm_orig * norm_var)))
+            cos_sim = max(-1.0, min(1.0, cos_sim))
+            drift = 1.0 - cos_sim
+
+            if drift < 0.03:
+                status = "STABLE"
+                is_stable = True
+            else:
+                status = "HIGH DRIFT"
+                is_stable = False
+
+            neural_stabilities.append((cos_sim, drift, is_stable))
+            print(f"{item['id']:<20} | {cos_sim:<12.4f} | {drift:<14.4f} | {status:<18}")
+
+    # 4. Final Solution Decisions
+    print("\n[4] Final Decision Output (Combined Neuro-Symbolic / Contrastive):")
     print("-" * 80)
     predictions = predict_contrastive_robustness(
-        model_id="deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
+        model_id=model_name or "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
         reasoning_effort="default",
         problems=problems,
     )
 
     for item, pred in zip(UNSEEN_OLYMPIAD_PROBLEMS, predictions):
-        status = "ROBUST (Stable under perturbation)" if pred else "FRAGILE (Sensitive to perturbation)"
+        status = "ROBUST (True)" if pred else "FRAGILE (False)"
         print(f"  * {item['id']:<20} [{item['domain']:<32}] => {status}")
 
     print("\n" + "=" * 80)
@@ -124,4 +171,10 @@ def evaluate_unseen_olympiad():
 
 
 if __name__ == "__main__":
-    evaluate_unseen_olympiad()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--neural", action="store_true", help="Run active GPU neural forward passes")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
+    args = parser.parse_args()
+
+    active_model = args.model if args.neural else None
+    evaluate_unseen_olympiad(active_model)
