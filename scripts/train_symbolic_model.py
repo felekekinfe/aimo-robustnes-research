@@ -47,6 +47,10 @@ def load_dataset(dataset_name: str) -> tuple[pd.DataFrame, np.ndarray, np.ndarra
 
     if dataset_name == "train-main-v2":
         path = data_dir / "train-main-v2.jsonl"
+        if not path.is_file():
+            print(f"Data file {path} not found. Fetching from Hugging Face...")
+            import subprocess
+            subprocess.run([sys.executable, str(ROOT / "scripts" / "fetch_training_data.py")], check=True)
         with path.open("r", encoding="utf-8") as f:
             raw_rows = [json.loads(line) for line in f if line.strip()]
         valid_rows = [r for r in raw_rows if isinstance(r.get("is_robust"), bool)]
@@ -60,6 +64,10 @@ def load_dataset(dataset_name: str) -> tuple[pd.DataFrame, np.ndarray, np.ndarra
 
     elif dataset_name == "augmented-sample-math-agg":
         path = data_dir / "augmented-sample-math-agg.jsonl"
+        if not path.is_file():
+            print(f"Data file {path} not found. Fetching from Hugging Face...")
+            import subprocess
+            subprocess.run([sys.executable, str(ROOT / "scripts" / "fetch_training_data.py")], check=True)
         with path.open("r", encoding="utf-8") as f:
             raw_rows = [json.loads(line) for line in f if line.strip()]
         valid_rows = [r for r in raw_rows if isinstance(r.get("model_is_robust"), bool)]
