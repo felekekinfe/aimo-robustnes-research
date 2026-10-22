@@ -54,12 +54,22 @@ def analyze_real_aimo_problems(limit: int = 10):
     problems = [c["problem"] for c in cases]
     model_ids = [c["model_id"] for c in cases]
 
-    # Predict via the Contrastive White-Box solution
-    predictions = predict_contrastive_robustness(
-        model_id=model_ids[0],
-        reasoning_effort="low",
-        problems=problems,
-    )
+    # Batch cases by (model_id, reasoning_effort) identically to the official ingestion program
+    batches: dict[tuple[str, str], list[tuple[int, dict]]] = {}
+    for idx, case in enumerate(cases):
+        effort = case.get("reasoning_effort", "low")
+        batches.setdefault((case["model_id"], effort), []).append((idx, case))
+
+    predictions = [False] * len(cases)
+    for (model_id, effort), batch in batches.items():
+        batch_problems = [case["problem"] for _, case in batch]
+        batch_preds = predict_contrastive_robustness(
+            model_id=model_id,
+            reasoning_effort=effort,
+            problems=batch_problems,
+        )
+        for (idx, _), pred in zip(batch, batch_preds):
+            predictions[idx] = pred
 
     correct_count = 0
     total_evaluated = min(limit, len(cases))
