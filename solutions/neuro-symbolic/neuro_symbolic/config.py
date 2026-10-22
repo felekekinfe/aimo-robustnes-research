@@ -15,7 +15,7 @@ FUSION_ALPHA: float = 0.65
 DECISION_THRESHOLD: float = 0.50
 
 # Fallback decision threshold when neural model is unavailable (calibrated on training data)
-FALLBACK_DECISION_THRESHOLD: float = 0.45
+FALLBACK_DECISION_THRESHOLD: float = 0.40
 
 # Filenames
 NEURAL_PROBE_NAME = "probe_artifact.pkl"

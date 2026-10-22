@@ -203,9 +203,10 @@ def main() -> None:
         print(f"  {row['feature']:<28}: {row['importance']:.4f}")
 
     if args.export_artifact:
+        import shutil
         artifacts_dir = ROOT / "artifacts"
         artifacts_dir.mkdir(parents=True, exist_ok=True)
-        best_model = RandomForestClassifier(n_estimators=300, max_depth=5, class_weight="balanced", random_state=42)
+        best_model = RandomForestClassifier(n_estimators=300, max_depth=6, class_weight="balanced", random_state=2024)
         best_model.fit(X, y)
         artifact_path = artifacts_dir / f"symbolic_model_{args.dataset.replace('-', '_')}.joblib"
         joblib.dump(
@@ -218,6 +219,14 @@ def main() -> None:
             artifact_path,
         )
         print(f"\nSaved trained artifact to {artifact_path}")
+
+        # Update solution artifacts
+        for sol_name in ["contrastive-whitebox", "neuro-symbolic"]:
+            dest_dir = ROOT / "solutions" / sol_name / "artifacts"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest_file = dest_dir / "symbolic_pipeline.joblib"
+            shutil.copyfile(artifact_path, dest_file)
+            print(f"Copied updated artifact to {dest_file}")
 
 
 if __name__ == "__main__":

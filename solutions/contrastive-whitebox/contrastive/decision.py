@@ -18,7 +18,7 @@ MODEL_ALIASES: dict[str, str] = {
 }
 
 SYMBOLIC_ARTIFACT_NAME = "symbolic_pipeline.joblib"
-FALLBACK_THRESHOLD = 0.45
+FALLBACK_THRESHOLD = 0.40
 
 _LOADED_SYMBOLIC_MODEL = None
 

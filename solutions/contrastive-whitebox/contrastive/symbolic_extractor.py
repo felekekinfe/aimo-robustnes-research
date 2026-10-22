@@ -59,6 +59,10 @@ SYMBOLIC_FEATURE_NAMES: tuple[str, ...] = (
     "has_find_evaluate",
     "has_prove",
     "question_mark_count",
+    # Narrative & Word problem indicators
+    "narrative_step_count",
+    "is_word_problem",
+    "subscript_density",
     # Cognitive load & Model-conditioned priors
     "cognitive_load",
     "model_param_log",
@@ -102,6 +106,10 @@ RE_RECURRENCE = re.compile(
 )
 RE_INTEGER_CONSTRAINT = re.compile(
     r"\b(integer|integers|positive integer|whole number|divisible by|multiple of)\b",
+    re.IGNORECASE,
+)
+RE_NARRATIVE_STEPS = re.compile(
+    r"\b(then|after|before|each|every|remaining|erases?|writes?|operates?|schedule|flights?|airline|board|consecutive|regardless)\b",
     re.IGNORECASE,
 )
 
@@ -230,6 +238,10 @@ def extract_symbolic_features(
     has_prv = 1.0 if RE_PROVE.search(text) else 0.0
     question_mark_count = float(text.count("?"))
 
+    narrative_step_count = float(len(RE_NARRATIVE_STEPS.findall(text)))
+    is_word_problem = 1.0 if (math_char_ratio < 0.20 and char_count > 220.0) else 0.0
+    subscript_density = subscript_count / max(1.0, word_count)
+
     # Cognitive load and capacity ratios
     cognitive_load = (char_count * math_char_ratio) / 100.0
     model_param_log = parse_model_param_log(model_id)
@@ -268,6 +280,9 @@ def extract_symbolic_features(
         "has_find_evaluate": has_find,
         "has_prove": has_prv,
         "question_mark_count": question_mark_count,
+        "narrative_step_count": narrative_step_count,
+        "is_word_problem": is_word_problem,
+        "subscript_density": subscript_density,
         "cognitive_load": cognitive_load,
         "model_param_log": model_param_log,
         "reasoning_effort_scale": reasoning_effort_scale,
