@@ -38,7 +38,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from aimo_symbolic.features import SYMBOLIC_FEATURE_NAMES, extract_feature_dataframe
+from aimo_symbolic.features import SYMBOLIC_FEATURE_NAMES, extract_symbolic_features
 
 
 def load_dataset(dataset_name: str) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, list[str]]:
@@ -49,12 +49,14 @@ def load_dataset(dataset_name: str) -> tuple[pd.DataFrame, np.ndarray, np.ndarra
         path = data_dir / "train-main-v2.jsonl"
         with path.open("r", encoding="utf-8") as f:
             raw_rows = [json.loads(line) for line in f if line.strip()]
-        # Filter rows with non-null boolean is_robust
         valid_rows = [r for r in raw_rows if isinstance(r.get("is_robust"), bool)]
         problems = [r["problem"] for r in valid_rows]
         labels = np.array([r["is_robust"] for r in valid_rows], dtype=bool)
-        # Group by first 100 characters of problem to group variants
+        model_ids = [r.get("model_id", "default") for r in valid_rows]
+        efforts = [r.get("reasoning_effort", "default") for r in valid_rows]
         groups = np.array([r["problem"][:100] for r in valid_rows])
+        rows = [extract_symbolic_features(p, m, e) for p, m, e in zip(problems, model_ids, efforts)]
+        features_df = pd.DataFrame(rows, columns=list(SYMBOLIC_FEATURE_NAMES))
 
     elif dataset_name == "augmented-sample-math-agg":
         path = data_dir / "augmented-sample-math-agg.jsonl"
@@ -63,12 +65,14 @@ def load_dataset(dataset_name: str) -> tuple[pd.DataFrame, np.ndarray, np.ndarra
         valid_rows = [r for r in raw_rows if isinstance(r.get("model_is_robust"), bool)]
         problems = [r["original_problem"] for r in valid_rows]
         labels = np.array([r["model_is_robust"] for r in valid_rows], dtype=bool)
+        model_ids = [r.get("model_id", "default") for r in valid_rows]
         groups = np.array([r.get("problem_id", r["original_problem"][:100]) for r in valid_rows])
+        rows = [extract_symbolic_features(p, m, "default") for p, m in zip(problems, model_ids)]
+        features_df = pd.DataFrame(rows, columns=list(SYMBOLIC_FEATURE_NAMES))
 
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
-    features_df = extract_feature_dataframe(problems)
     return features_df, labels, groups, problems
 
 

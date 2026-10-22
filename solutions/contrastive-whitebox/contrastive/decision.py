@@ -71,7 +71,11 @@ def predict_contrastive_robustness(
 
     # 1. Compute Symbolic Probabilities as Baseline Priors
     symbolic_model = _load_symbolic_model()
-    features_df = extract_feature_dataframe(problems)
+    features_df = extract_feature_dataframe(
+        problems,
+        model_id=resolved_model_id,
+        reasoning_effort=reasoning_effort,
+    )
     if symbolic_model is not None and hasattr(symbolic_model, "predict_proba"):
         try:
             probs = symbolic_model.predict_proba(features_df)
