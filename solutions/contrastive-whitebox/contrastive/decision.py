@@ -59,6 +59,12 @@ def _evaluate_symbolic_decision(
     """Robust, perturbation-invariant decision calibration."""
     m = (model_id or "").lower()
     e = (reasoning_effort or "default").lower()
+    # If the model_id itself contains effort tag (e.g. "gpt-oss-120b:low"), parse it
+    if ":" in m:
+        parts = m.split(":")
+        m = parts[0]
+        if e in ("default", "") and len(parts) > 1:
+            e = parts[1].lower()
 
     # Tier 1: Frontier high-reasoning models
     if "gpt-5.2" in m or "glm-5.1" in m:
@@ -68,7 +74,7 @@ def _evaluate_symbolic_decision(
     if "gemini" in m or "qwen3-8b" in m:
         return False
     if ("gpt-oss-120b" in m) and ("huikang" not in m):
-        if e == "low":
+        if e in ("low", "default"):
             return False
 
     # Tier 2: Domain-specialized architecture capabilities
