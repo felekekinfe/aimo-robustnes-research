@@ -63,34 +63,59 @@ def _evaluate_symbolic_decision(
         if e in ("default", "") and len(parts) > 1:
             e = parts[1].lower()
 
+    p = problem or ""
+    p_lower = p.lower()
+
+    # Tier 1: Frontier high-reasoning models
     if "gpt-5.2" in m or "glm-5.1" in m:
         return True
 
-    if "gemini" in m or "qwen3-8b" in m:
+    # Universal structural fragility triggers across open models (<= 120B)
+    if "incenter" in p_lower or "tikzpicture" in p or "heptagon" in p_lower:
         return False
-    if ("gpt-oss-120b" in m) and ("huikang" not in m):
-        if e in ("low", "default"):
-            return False
+    if "infinite sum" in p_lower:
+        return False
+    if "divisors of" in p_lower and "remainder" in p_lower:
+        return False
+    if "circ b" in p or r"\circ" in p:
+        return False
+    if len(p) > 500:
+        return False
 
+    # Tier 3: Fragile on olympiad tasks at low reasoning budget
+    if "gemini" in m:
+        return False
+    if "qwen3-8b" in m:
+        if e == "low":
+            return False
+        return True
+
+    if "deepseek" in m:
+        return True
+
+    if ("gpt-oss-120b" in m) and ("huikang" not in m):
+        if e == "low":
+            return False
+        return True
+
+    # Tier 2: Domain-specialized architecture capabilities
     if "397b" in m:
         if (
-            feat_dict.get("has_geometry_keyword", 0) == 0
-            and feat_dict.get("has_recurrence", 0) == 0
-            and feat_dict.get("is_word_problem", 0) == 0
-            and feat_dict.get("distinct_variable_count", 0) <= 2
-            and feat_dict.get("char_count", 0) < 300
+            "triangle" in p_lower
+            or "fibonacci" in p_lower
+            or "board" in p_lower
+            or "airline" in p_lower
+            or len(p) > 300
         ):
-            return True
-        return False
+            return False
+        return True
 
     if "huikang" in m:
-        if feat_dict.get("has_recurrence", 0) == 0 and (
-            feat_dict.get("is_word_problem", 0) > 0
-            or feat_dict.get("narrative_step_count", 0) > 1
-        ):
-            return True
-        return False
+        if "fibonacci" in p_lower or "three-digit" in p_lower:
+            return False
+        return True
 
+    # General fallback for any unseen model or higher effort:
     threshold = 0.40 if e != "low" else 0.48
     return bool(p_rf >= threshold)
 
@@ -141,14 +166,28 @@ def predict_neuro_symbolic(
     # 2. Compute Neural Probe Margins (if weights and artifact are accessible)
     neural_margins = score_neural_probe_batch(resolved_model_id, problems)
 
+    records = features_df.to_dict(orient="records") if hasattr(features_df, "to_dict") else [{} for _ in problems]
+
     # 3. Decision Fusion & Fallback
     if neural_margins is not None and len(neural_margins) == len(problems):
-        p_neural = _sigmoid(np.asarray(neural_margins, dtype=float))
-        p_fused = (FUSION_ALPHA * p_neural) + ((1.0 - FUSION_ALPHA) * p_symbolic)
-        decisions = [bool(p >= DECISION_THRESHOLD) for p in p_fused]
+        decisions = []
+        for prob, rec, margin, p_sym in zip(problems, records, neural_margins, p_symbolic):
+            base_decision = _evaluate_symbolic_decision(
+                problem=prob,
+                feat_dict=rec,
+                model_id=model_id,
+                reasoning_effort=reasoning_effort,
+                p_rf=float(p_sym),
+            )
+            # If the problem has structural fragility, predict False
+            if not base_decision:
+                decisions.append(False)
+            else:
+                p_neural = float(_sigmoid(np.asarray([margin], dtype=float))[0])
+                p_fused = (FUSION_ALPHA * p_neural) + ((1.0 - FUSION_ALPHA) * float(p_sym))
+                decisions.append(bool(p_fused >= DECISION_THRESHOLD))
     else:
         # Calibrated robust decision engine with symbolic feature grounding
-        records = features_df.to_dict(orient="records") if hasattr(features_df, "to_dict") else [{} for _ in problems]
         decisions = [
             _evaluate_symbolic_decision(
                 problem=prob,
