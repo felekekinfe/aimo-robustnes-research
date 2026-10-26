@@ -1,7 +1,8 @@
 """Contrastive latent representation and invariance detector.
 
-Computes internal hidden states for the original problem and its meaning-preserving
-variant, evaluating cosine similarity, representation drift, and probe stability.
+Computes internal hidden states and next-token distributions for the original problem
+and its meaning-preserving variant without token generation, evaluating cosine similarity,
+representation drift, probe stability, and next-token KL divergence.
 """
 
 from __future__ import annotations
@@ -46,6 +47,8 @@ class ContrastiveMetrics:
     margin_orig: float
     margin_variant: float
     margin_agreement: bool
+    kl_div: float = 0.0
+    entropy: float = 0.0
 
 
 def _safe_model_id(model_id: str) -> str:
@@ -142,7 +145,13 @@ def _build_prompt(tokenizer: Any, problem_text: str, system_prompt: str) -> str:
     return f"{system_prompt}\n\n{problem_text}" if system_prompt else problem_text
 
 
-def _encode_problem(tokenizer: Any, model: Any, problem_text: str, artifact: ProbeArtifact) -> np.ndarray:
+def _encode_problem(
+    tokenizer: Any,
+    model: Any,
+    problem_text: str,
+    artifact: ProbeArtifact,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Single forward pass extracting prompt-final hidden state and next-token logits."""
     prompt = _build_prompt(tokenizer, problem_text, artifact.system_prompt)
     model_inputs = tokenizer(prompt, return_tensors="pt", truncation=True)
     model_inputs = {name: val.to(model.device) for name, val in model_inputs.items()}
@@ -152,7 +161,46 @@ def _encode_problem(tokenizer: Any, model: Any, problem_text: str, artifact: Pro
 
     hidden_states = output.hidden_states
     layer = _layer_index(artifact)
-    return hidden_states[layer][0, -1, :].detach().float().cpu().numpy()
+    vec = hidden_states[layer][0, -1, :].detach().float().cpu().numpy()
+
+    if hasattr(output, "logits") and output.logits is not None:
+        logits = output.logits[0, -1, :].detach().float().cpu().numpy()
+    else:
+        logits = np.zeros(10, dtype=np.float32)
+
+    return vec, logits
+
+
+def _compute_kl_and_entropy(
+    logits_orig: np.ndarray,
+    logits_var: np.ndarray,
+) -> tuple[float, float]:
+    """Compute baseline entropy and symmetric KL divergence of next-token distribution."""
+    try:
+        if len(logits_orig) > 256:
+            top_idx = np.argpartition(logits_orig, -256)[-256:]
+            lo = logits_orig[top_idx]
+            lv = logits_var[top_idx]
+        else:
+            lo, lv = logits_orig, logits_var
+
+        e_lo = np.exp(lo - np.max(lo))
+        p = e_lo / max(1e-12, float(np.sum(e_lo)))
+
+        e_lv = np.exp(lv - np.max(lv))
+        q = e_lv / max(1e-12, float(np.sum(e_lv)))
+
+        eps = 1e-12
+        p = np.clip(p, eps, 1.0)
+        q = np.clip(q, eps, 1.0)
+
+        entropy = -float(np.sum(p * np.log(p)))
+        kl_pq = float(np.sum(p * np.log(p / q)))
+        kl_qp = float(np.sum(q * np.log(q / p)))
+        sym_kl = max(0.0, 0.5 * (kl_pq + kl_qp))
+        return entropy, sym_kl
+    except Exception:
+        return 0.0, 0.0
 
 
 def compute_ensemble_margin(vector: np.ndarray, artifact: ProbeArtifact) -> float:
@@ -180,8 +228,10 @@ def compute_contrastive_metrics(
     vec_orig: np.ndarray,
     vec_var: np.ndarray,
     artifact: ProbeArtifact,
+    logits_orig: np.ndarray | None = None,
+    logits_var: np.ndarray | None = None,
 ) -> ContrastiveMetrics:
-    """Compute latent invariance and probe agreement metrics between representations."""
+    """Compute latent invariance, probe agreement, and next-token distribution divergence."""
     norm_orig = np.linalg.norm(vec_orig)
     norm_var = np.linalg.norm(vec_var)
 
@@ -200,6 +250,11 @@ def compute_contrastive_metrics(
     margin_var = compute_ensemble_margin(vec_var, artifact)
     margin_agree = (margin_orig >= 0.0) == (margin_var >= 0.0)
 
+    if logits_orig is not None and logits_var is not None:
+        entropy, kl_div = _compute_kl_and_entropy(logits_orig, logits_var)
+    else:
+        entropy, kl_div = 0.0, 0.0
+
     return ContrastiveMetrics(
         cosine_sim=cos_sim,
         latent_drift=latent_drift,
@@ -207,6 +262,8 @@ def compute_contrastive_metrics(
         margin_orig=margin_orig,
         margin_variant=margin_var,
         margin_agreement=margin_agree,
+        kl_div=kl_div,
+        entropy=entropy,
     )
 
 
@@ -215,7 +272,7 @@ def extract_contrastive_batch(
     original_problems: list[str],
     variant_problems: list[str],
 ) -> list[ContrastiveMetrics] | None:
-    """Extract contrastive white-box metrics for a batch of problems.
+    """Extract contrastive prefill metrics for a batch of problems.
 
     Returns:
         List of ContrastiveMetrics, or None if the neural branch is unavailable.
@@ -233,9 +290,15 @@ def extract_contrastive_batch(
     try:
         results = []
         for p_orig, p_var in zip(original_problems, variant_problems):
-            v_orig = _encode_problem(tokenizer, model, p_orig, artifact)
-            v_var = _encode_problem(tokenizer, model, p_var, artifact)
-            metrics = compute_contrastive_metrics(v_orig, v_var, artifact)
+            v_orig, log_orig = _encode_problem(tokenizer, model, p_orig, artifact)
+            v_var, log_var = _encode_problem(tokenizer, model, p_var, artifact)
+            metrics = compute_contrastive_metrics(
+                v_orig,
+                v_var,
+                artifact,
+                logits_orig=log_orig,
+                logits_var=log_var,
+            )
             results.append(metrics)
         return results
     except Exception:
