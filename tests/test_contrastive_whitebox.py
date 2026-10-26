@@ -159,6 +159,33 @@ class ContrastiveWhiteBoxTests(unittest.TestCase):
         decision_collapsed = finalize_decision(0.10, collapsed_metric, decision_threshold=0.30)
         self.assertFalse(decision_collapsed)
 
+    def test_neural_variants_latex_lock(self) -> None:
+        """Verify generate_neural_variants enforces the LaTeX-Lock invariant restoring original math."""
+        from contrastive.neural_perturbation_engine import generate_neural_variants
+        import torch
+
+        problem = "Determine all real $x$ such that $x^2 + 5x + 6 = 0$."
+
+        mock_tokenizer = mock.MagicMock()
+        mock_tokenizer.padding_side = "right"
+        mock_tokenizer.pad_token_id = 0
+        mock_tokenizer.eos_token_id = 0
+        mock_tokenizer.return_value = {
+            "input_ids": torch.tensor([[1, 2, 3]]),
+            "attention_mask": torch.tensor([[1, 1, 1]]),
+        }
+        mock_tokenizer.decode.return_value = "Find the real values that satisfy the quadratic equation."
+
+        mock_model = mock.MagicMock()
+        mock_model.device = "cpu"
+        mock_model.generate.return_value = torch.tensor([[1, 2, 3, 4, 5]])
+
+        variants = generate_neural_variants(problem, mock_model, mock_tokenizer, n=1)
+        self.assertEqual(len(variants), 1)
+        # Verify the LaTeX-Lock Invariant restored the original math blocks
+        self.assertIn("$x$", variants[0])
+        self.assertIn("$x^2 + 5x + 6 = 0$", variants[0])
+
 
 if __name__ == "__main__":
     unittest.main()
