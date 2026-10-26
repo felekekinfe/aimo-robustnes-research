@@ -35,8 +35,9 @@ def directory_entries(directory: Path) -> dict[str, bytes]:
         if (
             path.is_file()
             and "__pycache__" not in relative.parts
-            and not path.name.endswith((".pyc", ".pyo"))
+            and not path.name.endswith((".pyc", ".pyo", ".pkl", ".joblib"))
             and not path.name.startswith(".")
+            and path.name != "neural_perturbation_engine.py"
         ):
             entries[relative.as_posix()] = path.read_bytes()
     if not entries:
@@ -70,8 +71,10 @@ def solution_archive_name(name: str, small: bool = False) -> str:
     return f"solution-{name}{suffix}.zip"
 
 
-def build_solutions(small: bool = False) -> None:
+def build_solutions(small: bool = False, solution_name: str | None = None) -> None:
     for name, directory in solutions():
+        if solution_name and name != solution_name:
+            continue
         entries = directory_entries(directory)
         marker_names = [
             path for path in entries if "/" not in path and path.casefold() == "small.txt"
@@ -238,6 +241,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="with target=solutions, build small-track ZIPs containing a blank small.txt",
     )
+    parser.add_argument(
+        "--solution",
+        type=str,
+        default=None,
+        help="with target=solutions, build only the specified solution name",
+    )
     parser.add_argument("--mode", choices=["embedded", "linked"], default="embedded")
     parser.add_argument(
         "--input-dir",
@@ -267,7 +276,7 @@ def main() -> None:
     if args.small and args.target != "solutions":
         raise SystemExit("--small is only supported with target=solutions")
     if args.target == "solutions":
-        build_solutions(small=args.small)
+        build_solutions(small=args.small, solution_name=args.solution)
     elif args.target == "components":
         build_components(args.input_dir, args.reference_dir)
     elif args.target == "task":

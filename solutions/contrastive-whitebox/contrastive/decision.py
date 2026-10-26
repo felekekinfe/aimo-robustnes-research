@@ -235,25 +235,20 @@ def finalize_decision(
     return bool(adjusted_z < decision_threshold)
 
 
-def _evaluate_symbolic_decision(
+def _evaluate_symbolic_probability(
     problem: str,
     feat_dict: dict,
     model_id: str,
     reasoning_effort: str,
-    p_rf: float = 0.5,
-) -> bool:
-    """Precision-calibrated symbolic decision baseline for offline/fallback environments.
-
-    Validated with 86.25% accuracy across all 5 competition models.
-    """
+) -> float:
+    """Continuous symbolic robustness probability in [0.05, 0.95]."""
     m, e = split_model_and_effort(model_id, reasoning_effort)
     m = m.lower()
-    p = problem or ""
-    f = _problem_features(p)
+    f = feat_dict or _problem_features(problem or "")
 
-    # Frontier models (e.g. GPT-5.2)
+    # Frontier models (e.g. GPT-5.2, GLM-5.1) are inherently robust
     if "gpt-5.2" in m or "glm-5.1" in m:
-        return True
+        return 0.95
 
     # Universal structural fragility triggers across open models (<= 120B)
     if (
@@ -269,21 +264,41 @@ def _evaluate_symbolic_decision(
         or (f["has_bisector"] and f["has_triangle"])
         or f["has_acute_triangle"]
     ):
-        return False
+        return 0.15
 
-    # Low-effort reasoning failure
+    # Low-effort reasoning failure (insufficient token budget on Olympiad tasks)
     if e == "low":
-        return False
+        return 0.20
 
     # Model scale limits
-    if "4b" in m:
+    if "4b" in m or "3b" in m or "1.5b" in m:
         if f["len"] > 320 or f["has_triangle"]:
-            return False
+            return 0.25
+        return 0.60
     elif "7b" in m or "8b" in m:
         if f["len"] > 450:
-            return False
+            return 0.30
+        return 0.70
 
-    return True
+    if any(tag in m for tag in ("120b", "397b", "70b", "72b")):
+        return 0.85
+
+    return 0.65
+
+
+def _evaluate_symbolic_decision(
+    problem: str,
+    feat_dict: dict,
+    model_id: str,
+    reasoning_effort: str,
+    p_rf: float = 0.5,
+) -> bool:
+    """Precision-calibrated symbolic decision baseline for offline/fallback environments.
+
+    Validated with 86.25% accuracy across all 5 competition models.
+    """
+    prob = _evaluate_symbolic_probability(problem, feat_dict, model_id, reasoning_effort)
+    return bool(prob >= 0.50)
 
 
 def predict_contrastive_robustness(
@@ -314,11 +329,9 @@ def predict_contrastive_robustness(
 
     # --- Stage 1: Try White-Box Contrastive Extraction ---
     try:
-        variants = [generate_contrastive_variant(p) for p in problems]
         contrastive_metrics = extract_contrastive_batch(
             model_id=base_model_id,
             original_problems=problems,
-            variant_problems=variants,
         )
     except Exception:
         traceback.print_exc()
@@ -329,19 +342,34 @@ def predict_contrastive_robustness(
         decisions: list[bool] = []
         for prob, metric in zip(problems, contrastive_metrics):
             feat_dict = _problem_features(prob)
-            sym_robust = bool(
-                _evaluate_symbolic_decision(
-                    problem=prob,
-                    feat_dict=feat_dict,
-                    model_id=model_id,
-                    reasoning_effort=effort,
-                    p_rf=0.5,
-                )
+            p_sym = _evaluate_symbolic_probability(
+                problem=prob,
+                feat_dict=feat_dict,
+                model_id=model_id,
+                reasoning_effort=effort,
             )
             z_comp, hard_veto = compute_instability_score(
                 metric, prob, base_model_id, effort, calibrator
             )
             adj_z = z_comp
+
+            # Late-layer internal disagreement penalty
+            late_agree = getattr(metric, "late_layer_agreement", 1.0)
+            if late_agree < 0.85:
+                adj_z += 0.25 * (0.85 - late_agree) / 0.15
+
+            # Model Capacity & Effort Conditioning (Crucial when using Proxy on Oversized Models)
+            m_lower = (model_id or "").lower()
+            if any(tag in m_lower for tag in ("120b", "397b", "gpt-5", "gemini", "70b", "72b", "gpt-oss", "frontier")):
+                adj_z -= 0.40
+            elif any(tag in m_lower for tag in ("4b", "1.5b", "3b")):
+                adj_z += 0.25
+
+            if effort == "low":
+                adj_z += 0.35
+            elif effort == "high":
+                adj_z -= 0.25
+
             if metric.used_micro_rollout:
                 r_conv = metric.rollout_convergence_ratio or 1.0
                 r_margin = metric.rollout_min_margin or 0.0
@@ -350,19 +378,10 @@ def predict_contrastive_robustness(
                 elif r_conv > 1.15 or r_margin < 0.12:
                     adj_z += 0.65
 
-            # NEURO-SYMBOLIC DECISION RULE (Strictly Independent Per-Problem):
-            # 1. If hard_veto triggered, problem is non-robust (False).
-            # 2. Convert symbolic baseline into a prior offset on adj_z:
-            #    - If symbolic engine flags problem as fragile (sym_robust == False),
-            #      add +0.45 instability penalty (only rescue to True if neural states are rock-solid: adj_z < -0.25).
-            #    - If symbolic engine says robust (sym_robust == True),
-            #      veto to False if neural instability is high (adj_z >= 0.35).
-            if hard_veto:
-                is_robust = False
-            elif not sym_robust:
-                is_robust = bool(adj_z < -0.25)
-            else:
-                is_robust = bool(adj_z < 0.35)
+            # Smooth Log-Odds Fusion (Strictly Independent Per-Problem):
+            p_wb = 1.0 / (1.0 + math.exp(max(-10.0, min(10.0, 1.35 * (adj_z - 0.15)))))
+            p_final = 0.65 * p_wb + 0.35 * p_sym
+            is_robust = bool(p_final >= 0.50 and not hard_veto)
 
             decisions.append(is_robust)
 
