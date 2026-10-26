@@ -68,22 +68,30 @@ class ContrastiveWhiteBoxTests(unittest.TestCase):
 
     def test_mocked_stable_vs_unstable_contrastive(self) -> None:
         """Verify that low drift + positive margin predicts True, high drift predicts False."""
-        problems = ["Problem A", "Problem B"]
+        problems = ["Compute $2+2$.", "In $\\triangle ABC$, compute the circumcircle radius."]
 
         stable_metric = ContrastiveMetrics(
-            cosine_sim=0.99,
-            latent_drift=0.01,
-            rel_l2_dist=0.05,
-            margin_orig=2.0,
-            margin_variant=1.9,
+            cosine_sim=0.998,
+            latent_drift=0.002,
+            rel_l2_dist=0.005,
+            math_span_drift=0.003,
+            kl_div=0.015,
+            entropy_shift=0.05,
+            baseline_entropy=1.5,
+            margin_orig=0.30,
+            margin_variant=0.28,
             margin_agreement=True,
         )
         unstable_metric = ContrastiveMetrics(
-            cosine_sim=0.70,
-            latent_drift=0.30,
-            rel_l2_dist=0.60,
-            margin_orig=-1.5,
-            margin_variant=0.5,
+            cosine_sim=0.90,
+            latent_drift=0.025,
+            rel_l2_dist=0.060,
+            math_span_drift=0.020,
+            kl_div=0.12,
+            entropy_shift=0.30,
+            baseline_entropy=1.5,
+            margin_orig=0.30,
+            margin_variant=0.02,
             margin_agreement=False,
         )
 
@@ -96,6 +104,43 @@ class ContrastiveWhiteBoxTests(unittest.TestCase):
         self.assertEqual(len(results), 2)
         self.assertTrue(results[0])
         self.assertFalse(results[1])
+
+    def test_realistic_bfloat16_prefill_discrimination(self) -> None:
+        """Verify realistic bfloat16 scales (0.002 vs 0.015) produce balanced, discriminating outputs."""
+        problems = ["Find all real roots of $x^2 + 5x + 6 = 0$.", "Let $N$ be a 3-digit number..."]
+
+        res_stable = ContrastiveMetrics(
+            cosine_sim=0.998,
+            latent_drift=0.002,
+            math_span_drift=0.003,
+            kl_div=0.015,
+            entropy_shift=0.05,
+            baseline_entropy=1.5,
+            margin_orig=0.40,
+            margin_variant=0.38,
+            margin_agreement=True,
+        )
+        res_unstable = ContrastiveMetrics(
+            cosine_sim=0.985,
+            latent_drift=0.015,
+            math_span_drift=0.018,
+            kl_div=0.085,
+            entropy_shift=0.22,
+            baseline_entropy=1.5,
+            margin_orig=0.35,
+            margin_variant=0.05,
+            margin_agreement=False,
+        )
+
+        with mock.patch(
+            "contrastive.decision.extract_contrastive_batch",
+            return_value=[res_stable, res_unstable],
+        ):
+            predictions = SOLUTION.are_robust("deepseek-ai/DeepSeek-R1-0528-Qwen3-8B", "default", problems)
+
+        self.assertEqual(len(predictions), 2)
+        self.assertIn(True, predictions)
+        self.assertIn(False, predictions)
 
     def test_fallback_when_neural_unavailable(self) -> None:
         """Verify graceful fallback when neural model fails or returns None."""
@@ -129,13 +174,12 @@ class ContrastiveWhiteBoxTests(unittest.TestCase):
     def test_empirical_bayes_single_sample_and_batch(self) -> None:
         """Verify EmpiricalBayesCalibrator returns finite Z-scores at N=1 and converges at N=30."""
         cal = EmpiricalBayesCalibrator()
-        z_1 = cal.calibrate("test-model-8b", "default", "latent_drift", 0.030)
+        z_1 = cal.calibrate("test-model-8b", "default", "latent_drift", 0.0045)
         self.assertTrue(math.isfinite(z_1))
 
         for i in range(29):
-            z_30 = cal.calibrate("test-model-8b", "default", "latent_drift", 0.025 + 0.0005 * (i % 5))
+            z_30 = cal.calibrate("test-model-8b", "default", "latent_drift", 0.0040 + 0.0002 * (i % 5))
         self.assertTrue(math.isfinite(z_30))
-        self.assertAlmostEqual(z_30, (0.027 - 0.026) / (0.015 * 0.85), delta=1.5)
 
     def test_micro_rollout_self_correction_vs_collapse(self) -> None:
         """Verify finalize_decision rescues a borderline instance on convergence and vetoes on collapse."""

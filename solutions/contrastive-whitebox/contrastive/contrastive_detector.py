@@ -204,7 +204,7 @@ def extract_prefill_metrics(
             dist = (1.0 - sims).mean().item()
             layer_drifts.append(dist)
 
-        latent_drift = float(np.mean(layer_drifts)) if layer_drifts else 0.0
+        centered_last_token_cosine_drift = float(np.mean(layer_drifts)) if layer_drifts else 0.0
 
         # Relative L2 drift on top layer
         hs_top = out.hidden_states[-1].float()
@@ -214,7 +214,7 @@ def extract_prefill_metrics(
         base_norm = torch.norm(h0_top) + 1e-8
         rel_l2_drift = float((diff_norm / base_norm).mean().item())
 
-        # Math-Token Subspace Pooling
+        # Math-Token Subspace Pooling & Math Span Drift
         input_ids = enc["input_ids"]
         math_pooled_list = []
         for i in range(batch_size):
@@ -234,12 +234,22 @@ def extract_prefill_metrics(
         math_sims = F.cosine_similarity(math_pooled_tensor[0:1], math_pooled_tensor[1:], dim=-1)
         math_span_drift = float((1.0 - math_sims).mean().item())
 
-        # Final-position Logits & Temperature-Smoothed Bounded JSD
+        # Tail + Math-Span Drift: 0.5 * centered last token + 0.5 * math span drift
+        latent_drift = float(0.5 * centered_last_token_cosine_drift + 0.5 * math_span_drift)
+
+        # Final-position Logits & Top-64 Candidate Token JSD (avoid 150k vocab dilution)
         logits_list = [out.logits[i, last_valid_indices[i]].float() for i in range(batch_size)]
         logits_tensor = torch.stack(logits_list, dim=0)  # [B, V]
 
-        # Temperature-smoothed (T=2.0)
-        p_smooth = F.softmax(logits_tensor / 2.0, dim=-1).clamp(min=1e-8)
+        # Union of top-64 tokens from orig and variant(s)
+        top_cand_indices = set(torch.topk(logits_list[0], k=min(64, logits_list[0].size(-1))).indices.tolist())
+        for k in range(1, batch_size):
+            top_cand_indices.update(torch.topk(logits_list[k], k=min(64, logits_list[k].size(-1))).indices.tolist())
+        candidate_tensor = torch.tensor(sorted(top_cand_indices), device=logits_tensor.device, dtype=torch.long)
+        sliced_logits = logits_tensor[:, candidate_tensor]
+
+        # Temperature-smoothed (T=1.5) over candidate support
+        p_smooth = F.softmax(sliced_logits / 1.5, dim=-1).clamp(min=1e-8)
         p_0_s = p_smooth[0:1]
         p_k_s = p_smooth[1:]
         m_s = 0.5 * (p_0_s + p_k_s)
@@ -361,64 +371,34 @@ def run_micro_rollout_verification(
         tokenizer.padding_side = orig_padding_side
 
 
-MASSIVE_TAGS = ["120b", "397b", "moe", "frontier", "72b", "70b"]
-
-# Guaranteed offline 7B/8B/4B models cached on Codabench worker (from README)
-OFFLINE_PROXIES = [
-    "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
-    "Skywork/Skywork-OR1-Math-7B",
-    "allenai/Olmo-3-7B-Think",
-    "Qwen/Qwen3.5-4B",
-]
-
-
-def is_massive_model(model_id: str) -> bool:
-    """Check if model exceeds single-GPU VRAM and would spill into system RAM."""
-    m = (model_id or "").lower()
-    return any(tag in m for tag in MASSIVE_TAGS)
+REASONING_TRIGGER = "\n\nLet us solve this step by step: "
 
 
 def extract_contrastive_batch(
     model_id: str,
     original_problems: list[str],
     variant_problems: list[str],
-) -> tuple[list[ContrastiveMetrics] | None, bool]:
+) -> list[ContrastiveMetrics] | None:
     """Extract contrastive white-box metrics for a batch of problems.
 
-    OFFLINE-SAFE PROXY STEALER:
-    If model_id is a massive model (120B, 397B, MoE), intercept it before loading
-    615 shards into system RAM. Steals the fastest offline 7B/8B proxy model cached
-    on disk, runs prefill in milliseconds, and returns (metrics, is_massive=True).
-
-    Returns:
-        tuple (metrics_list_or_None, is_massive_proxy)
+    Loads model_id directly from the Codabench HF cache with persistent caching across
+    effort levels (:low, :medium, :high, :default) for the same base model.
     """
-    is_massive = is_massive_model(model_id)
-    target_load_id = model_id
-
-    if is_massive:
-        print(f"[contrastive] Proxy Stealer: intercepting massive model {model_id}")
-        target_load_id = None
-        for candidate in OFFLINE_PROXIES:
-            bundle = get_or_load_model(candidate)
-            if bundle is not None:
-                target_load_id = candidate
-                print(f"[contrastive] Proxy Stealer: substituted with cached fast proxy {candidate}")
-                break
-        if target_load_id is None:
-            target_load_id = model_id
-
-    model_bundle = get_or_load_model(target_load_id)
+    # Strip reasoning effort suffix to keep model cached across batches
+    base_model_id = model_id.split(":")[0].strip() if ":" in model_id else model_id.strip()
+    model_bundle = get_or_load_model(base_model_id)
     if model_bundle is None:
-        return None, False
+        return None
 
     tokenizer, model = model_bundle
     try:
         results = []
         for p_orig, p_var in zip(original_problems, variant_problems):
-            metrics = extract_prefill_metrics([p_orig, p_var], tokenizer, model)
+            p_orig_prompt = p_orig + REASONING_TRIGGER
+            p_var_prompt = p_var + REASONING_TRIGGER
+            metrics = extract_prefill_metrics([p_orig_prompt, p_var_prompt], tokenizer, model)
             results.append(metrics)
-        return results, is_massive
+        return results
     except Exception as exc:
         print(f"[contrastive] extract_contrastive_batch failed: {exc}")
-        return None, False
+        return None

@@ -7,7 +7,7 @@ and structural problem priors with safe fallback.
 NO-CRASH PROTOCOL:
 - Zero pickle/joblib loads (avoids sklearn version mismatch)
 - Offline-only model loading (local_files_only=True, device_map="auto")
-- Explicit VRAM cleanup between model_id groups
+- Preserves model cache across batches for same base_model_id
 - Global try/except with traceback logging
 - Every prediction is independent per-problem (no batch distribution hacking)
 """
@@ -20,39 +20,25 @@ from typing import Any
 
 
 def are_robust(
-    model_id: Any = None,
-    reasoning_effort: Any = "default",
-    problems: list[Any] | None = None,
+    model_id: str,
+    reasoning_effort: str = "default",
+    problems: list[str] | None = None,
     **kwargs: Any,
 ) -> list[bool]:
-    """Organizer-compliant entrypoint supporting all Codabench calling conventions:
+    """Organizer-compliant entrypoint.
 
-    1. are_robust(model_id: str, reasoning_effort: str, problems: list[str])  [Official]
-    2. are_robust(problems: list[dict])                                       [Batch-dict]
-    3. are_robust(model_id: str, problems: list[str])                         [Legacy 2-arg]
+    Supports both signatures:
+      - are_robust(model_id, reasoning_effort, problems)
+      - are_robust(model_id, problems)  [legacy 2-arg form]
+
+    Every problem is scored independently. Model loading is cached across
+    batches for VRAM efficiency, but the prediction for problem A never
+    depends on the predicted distribution of the rest of the batch.
 
     Returns:
-        List of native Python bools aligned with input problems.
+        List of native Python ``bool`` values aligned with ``problems``.
     """
-    # Convention 2: are_robust(problems: list[dict])
-    if isinstance(model_id, list) and len(model_id) > 0 and isinstance(model_id[0], dict):
-        items = model_id
-        predictions = [False] * len(items)
-        groups: dict[tuple[str, str], list[tuple[int, str]]] = {}
-        for idx, it in enumerate(items):
-            m = str(it.get("model_id", ""))
-            e = str(it.get("reasoning_effort", "default"))
-            p = str(it.get("problem", ""))
-            groups.setdefault((m, e), []).append((idx, p))
-
-        for (m_id, eff), grp in groups.items():
-            prob_list = [p for _, p in grp]
-            preds = are_robust(model_id=m_id, reasoning_effort=eff, problems=prob_list)
-            for (orig_idx, _), pr in zip(grp, preds):
-                predictions[orig_idx] = bool(pr)
-        return predictions
-
-    # Convention 3: legacy 2-arg are_robust(model_id, problems)
+    # --- Signature flexibility: handle 2-arg legacy calls ---
     if problems is None and isinstance(reasoning_effort, list):
         problems = reasoning_effort
         reasoning_effort = "default"

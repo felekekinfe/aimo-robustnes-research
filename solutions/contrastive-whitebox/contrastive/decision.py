@@ -53,19 +53,22 @@ def split_model_and_effort(raw_model_id: str, explicit_effort: str = "") -> Tupl
     return m, e
 
 
+DEFAULT_PRIORS: dict[str, tuple[float, float]] = {
+    "latent_drift": (0.0045, 0.0030),
+    "math_span_drift": (0.0065, 0.0045),
+    "kl_div": (0.0350, 0.0250),
+    "entropy_shift": (0.1200, 0.0800),
+    "baseline_entropy": (1.6500, 0.6500),
+}
+
+
 class EmpiricalBayesCalibrator:
     """Empirical-Bayes Shrinkage Calibrator for neural prefill and rollout metrics.
 
-    Uses only hardcoded mathematical priors — zero pickle dependencies.
+    Uses only hardcoded mathematical priors calibrated to bfloat16 scales — zero pickle dependencies.
     """
 
-    PRIORS: dict[str, tuple[float, float]] = {
-        "latent_drift": (0.028, 0.015),
-        "math_span_drift": (0.022, 0.012),
-        "kl_div": (0.085, 0.055),
-        "entropy_shift": (0.180, 0.110),
-        "baseline_entropy": (0.950, 0.450),
-    }
+    PRIORS: dict[str, tuple[float, float]] = DEFAULT_PRIORS
 
     def __init__(self) -> None:
         self.history: dict[tuple[str, str, str], list[float]] = {}
@@ -310,38 +313,35 @@ def predict_contrastive_robustness(
     base_model_id, effort = split_model_and_effort(model_id, reasoning_effort)
 
     # --- Stage 1: Try White-Box Contrastive Extraction ---
-    # Intercepts massive models (120B/397B) using the fast offline proxy stealer
     try:
         variants = [generate_contrastive_variant(p) for p in problems]
-        batch_result = extract_contrastive_batch(
+        contrastive_metrics = extract_contrastive_batch(
             model_id=base_model_id,
             original_problems=problems,
             variant_problems=variants,
         )
-        if isinstance(batch_result, tuple):
-            contrastive_metrics, is_massive_proxy = batch_result
-        else:
-            contrastive_metrics, is_massive_proxy = batch_result, False
     except Exception:
         traceback.print_exc()
         contrastive_metrics = None
-        is_massive_proxy = False
 
     if contrastive_metrics is not None and len(contrastive_metrics) == len(problems):
         calibrator = GLOBAL_CALIBRATOR
-
         decisions: list[bool] = []
         for prob, metric in zip(problems, contrastive_metrics):
+            feat_dict = _problem_features(prob)
+            sym_robust = bool(
+                _evaluate_symbolic_decision(
+                    problem=prob,
+                    feat_dict=feat_dict,
+                    model_id=model_id,
+                    reasoning_effort=effort,
+                    p_rf=0.5,
+                )
+            )
             z_comp, hard_veto = compute_instability_score(
                 metric, prob, base_model_id, effort, calibrator
             )
             adj_z = z_comp
-
-            # CAPACITY BONUS: When a massive model (120B+) is evaluated via 8B proxy,
-            # apply bonus to reflect the true model's superior reasoning resilience
-            if is_massive_proxy:
-                adj_z -= 0.45
-
             if metric.used_micro_rollout:
                 r_conv = metric.rollout_convergence_ratio or 1.0
                 r_margin = metric.rollout_min_margin or 0.0
@@ -350,8 +350,20 @@ def predict_contrastive_robustness(
                 elif r_conv > 1.15 or r_margin < 0.12:
                     adj_z += 0.65
 
-            # INDEPENDENT per-problem decision: fixed calibrated threshold
-            is_robust = bool(adj_z < 0.15)
+            # NEURO-SYMBOLIC DECISION RULE (Strictly Independent Per-Problem):
+            # 1. If hard_veto triggered, problem is non-robust (False).
+            # 2. Convert symbolic baseline into a prior offset on adj_z:
+            #    - If symbolic engine flags problem as fragile (sym_robust == False),
+            #      add +0.45 instability penalty (only rescue to True if neural states are rock-solid: adj_z < -0.25).
+            #    - If symbolic engine says robust (sym_robust == True),
+            #      veto to False if neural instability is high (adj_z >= 0.35).
+            if hard_veto:
+                is_robust = False
+            elif not sym_robust:
+                is_robust = bool(adj_z < -0.25)
+            else:
+                is_robust = bool(adj_z < 0.35)
+
             decisions.append(is_robust)
 
         return decisions
