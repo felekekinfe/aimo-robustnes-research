@@ -3,16 +3,20 @@
 Directly tests latent representation invariance under meaning-preserving
 perturbations, fusing cosine similarity, representation drift, probe margins,
 and structural problem priors with safe fallback.
+
+NO-CRASH PROTOCOL:
+- Zero pickle/joblib loads (avoids sklearn version mismatch)
+- Offline-only model loading (local_files_only=True, device_map="auto")
+- Explicit VRAM cleanup between model_id groups
+- Global try/except with traceback logging
+- Every prediction is independent per-problem (no batch distribution hacking)
 """
 
 from __future__ import annotations
 
+import gc
+import traceback
 from typing import Any
-from contrastive.decision import (
-    predict_contrastive_robustness,
-    _evaluate_symbolic_decision,
-    _problem_features,
-)
 
 
 def are_robust(
@@ -21,31 +25,36 @@ def are_robust(
     problems: list[str] | None = None,
     **kwargs: Any,
 ) -> list[bool]:
-    """Predict whether model reasoning on each problem is robust.
+    """Organizer-compliant entrypoint.
 
     Supports both signatures:
       - are_robust(model_id, reasoning_effort, problems)
-      - are_robust(model_id, problems)
+      - are_robust(model_id, problems)  [legacy 2-arg form]
+
+    Every problem is scored independently. Model loading is batched for
+    VRAM efficiency but the prediction for problem A never depends on
+    the predicted distribution of the rest of the batch.
 
     Returns:
-        List of native Python bools aligned with ``problems``.
+        List of native Python ``bool`` values aligned with ``problems``.
     """
-    # Guard against 2-argument calls where 'problems' was passed into positional 'reasoning_effort'
+    # --- Signature flexibility: handle 2-arg legacy calls ---
     if problems is None and isinstance(reasoning_effort, list):
         problems = reasoning_effort
         reasoning_effort = "default"
 
     if problems is None:
         problems = []
-
     if not problems:
         return []
 
     model_str = str(model_id or "")
     effort_str = str(reasoning_effort or "default")
 
-    # Primary execution path
+    # === PRIMARY EXECUTION PATH ===
     try:
+        from contrastive.decision import predict_contrastive_robustness
+
         results = predict_contrastive_robustness(
             model_id=model_str,
             reasoning_effort=effort_str,
@@ -58,11 +67,13 @@ def are_robust(
         ):
             return results
     except Exception:
-        pass
+        traceback.print_exc()
 
-    # Ironclad Fallback: Symbolic Decision Engine (100% exception-safe)
+    # === FALLBACK 1: Symbolic Decision Engine (zero imports beyond stdlib+re) ===
     try:
-        fallback_preds = [
+        from contrastive.decision import _evaluate_symbolic_decision, _problem_features
+
+        fallback = [
             bool(
                 _evaluate_symbolic_decision(
                     problem=p,
@@ -74,7 +85,10 @@ def are_robust(
             )
             for p in problems
         ]
-        return fallback_preds
+        return fallback
     except Exception:
-        # Ultimate fail-safe: always return native Python bools of exact required length
-        return [False for _ in problems]
+        traceback.print_exc()
+
+    # === FALLBACK 2: Ultimate fail-safe — always valid output ===
+    print(f"FATAL: all fallbacks failed for model_id={model_str}, returning [False]*{len(problems)}")
+    return [False for _ in problems]

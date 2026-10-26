@@ -2,12 +2,18 @@
 
 Implements batched prefill extraction across dynamic fractional layers, anisotropy centering,
 math-token subspace pooling, temperature-smoothed bounded JSD, and conditional 32-token micro-rollout.
+
+NO-CRASH PROTOCOL:
+- Zero pickle loads (probe_artifact.pkl is NOT loaded — avoids version mismatch)
+- Model loading uses local_files_only=True, device_map="auto", trust_remote_code=True
+- Explicit VRAM cleanup via unload_current_model()
+- Safe device resolution via _get_device(model) instead of model.device
 """
 
 from __future__ import annotations
 
+import gc
 import math
-import pickle
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,68 +60,60 @@ class ContrastiveMetrics:
     margin_agreement: bool = True
 
 
-@dataclass(frozen=True)
-class ProbeArtifact:
-    model_id: str
-    system_prompt: str
-    data: dict[str, Any]
-    kind: str
+# ---- REMOVED: ProbeArtifact, load_probe_artifact, _artifact_candidates ----
+# These loaded .pkl files which crash on Codabench due to sklearn version mismatch.
+# The white-box pipeline now loads models directly by model_id from the HF cache.
 
 
-def _safe_model_id(model_id: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", model_id).strip("_")
+def _get_device(model: Any) -> Any:
+    """Safely resolve the device a model's parameters live on.
 
-
-def _artifact_candidates(model_id: str) -> list[Path]:
-    root_dir = Path(__file__).resolve().parents[1]
-    safe_id = _safe_model_id(model_id)
-    candidates = []
-    if safe_id:
-        candidates.extend([
-            root_dir / "probe_artifacts" / f"{safe_id}.pkl",
-            root_dir / "probe_artifacts" / f"{safe_id}.npz",
-        ])
-    candidates.extend([
-        root_dir / "probe_artifact.pkl",
-        root_dir / "probe_artifacts" / "probe_artifact.pkl",
-        root_dir / "probe_artifact.npz",
-    ])
-    return candidates
-
-
-def load_probe_artifact(model_id: str) -> ProbeArtifact | None:
-    path = next((c for c in _artifact_candidates(model_id) if c.is_file()), None)
-    if path is None:
-        return None
+    With device_map="auto", model.device does not exist on nn.Module.
+    We fall back to inspecting the first parameter's device.
+    """
     try:
-        with path.open("rb") as handle:
-            data = pickle.load(handle)
-        if not isinstance(data, dict) or data.get("schema_version") != 2:
-            return None
-        return ProbeArtifact(
-            model_id=str(data.get("model_id") or ""),
-            system_prompt=str(data.get("system_prompt") or ""),
-            data=data,
-            kind="pickle",
-        )
+        return next(model.parameters()).device
+    except StopIteration:
+        pass
     except Exception:
-        return None
+        pass
+    return getattr(model, "device", torch.device("cpu") if HAS_TORCH_TRANSFORMERS else "cpu")
 
 
-def _layer_index(artifact: ProbeArtifact) -> int:
-    strategy = artifact.data.get("recommended_strategy") or {}
-    return int(strategy.get("layer_index", artifact.data["best_layer_index"]))
+def unload_current_model() -> None:
+    """Explicitly free GPU VRAM from the currently cached model."""
+    global _LOADED_MODEL_ID, _LOADED_TOKENIZER, _LOADED_MODEL
+    if _LOADED_MODEL is not None:
+        del _LOADED_MODEL
+    if _LOADED_TOKENIZER is not None:
+        del _LOADED_TOKENIZER
+    _LOADED_MODEL = None
+    _LOADED_TOKENIZER = None
+    _LOADED_MODEL_ID = None
+    gc.collect()
+    if HAS_TORCH_TRANSFORMERS and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def get_or_load_model(model_id: str) -> tuple[Any, Any] | None:
-    """Safely load or retrieve cached model and tokenizer offline."""
+    """Safely load or retrieve cached model and tokenizer offline.
+
+    If a different model_id is requested, the previous model is explicitly
+    unloaded from VRAM before loading the new one.
+    """
     global _LOADED_MODEL_ID, _LOADED_TOKENIZER, _LOADED_MODEL
 
     if not HAS_TORCH_TRANSFORMERS:
         return None
 
+    # Cache hit
     if _LOADED_MODEL_ID == model_id and _LOADED_MODEL is not None:
         return _LOADED_TOKENIZER, _LOADED_MODEL
+
+    # Free previous model VRAM before loading a new one
+    if _LOADED_MODEL is not None:
+        print(f"[contrastive] Unloading {_LOADED_MODEL_ID} to free VRAM...")
+        unload_current_model()
 
     try:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -123,10 +121,17 @@ def get_or_load_model(model_id: str) -> tuple[Any, Any] | None:
             torch.float16 if device == "cuda" else torch.float32
         )
 
-        tokenizer = AutoTokenizer.from_pretrained(model_id, local_files_only=True)
+        print(f"[contrastive] Loading {model_id} (local_files_only=True, device_map={'auto' if device == 'cuda' else device})...")
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_id,
+            local_files_only=True,
+            trust_remote_code=True,
+        )
         load_kwargs: dict[str, Any] = {
             "torch_dtype": dtype,
             "local_files_only": True,
+            "trust_remote_code": True,
         }
         if device == "cuda":
             load_kwargs["device_map"] = "auto"
@@ -142,8 +147,10 @@ def get_or_load_model(model_id: str) -> tuple[Any, Any] | None:
         _LOADED_MODEL_ID = model_id
         _LOADED_TOKENIZER = tokenizer
         _LOADED_MODEL = model
+        print(f"[contrastive] Successfully loaded {model_id}")
         return tokenizer, model
-    except Exception:
+    except Exception as exc:
+        print(f"[contrastive] Failed to load {model_id}: {exc}")
         return None
 
 
@@ -164,10 +171,7 @@ def extract_prefill_metrics(
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
         enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
-        try:
-            device = next(model.parameters()).device
-        except Exception:
-            device = getattr(model, "device", "cpu")
+        device = _get_device(model)
         enc = {k: v.to(device) for k, v in enc.items()}
 
         with torch.inference_mode():
@@ -299,7 +303,8 @@ def run_micro_rollout_verification(
 
         pair = prompts[:2]
         enc = tokenizer(pair, return_tensors="pt", padding=True)
-        enc = {k: v.to(model.device) for k, v in enc.items()}
+        device = _get_device(model)
+        enc = {k: v.to(device) for k, v in enc.items()}
 
         with torch.inference_mode():
             gen = model.generate(
@@ -361,17 +366,11 @@ def extract_contrastive_batch(
     original_problems: list[str],
     variant_problems: list[str],
 ) -> list[ContrastiveMetrics] | None:
-    """Extract contrastive white-box metrics for a batch of problems."""
-    # 1. Try loading requested model_id directly (available in Codabench cache)
+    """Extract contrastive white-box metrics for a batch of problems.
+
+    Loads model_id directly from the Codabench HF cache. No pickle artifacts.
+    """
     model_bundle = get_or_load_model(model_id)
-
-    # 2. If model_id not directly loadable, check probe artifact fallback
-    if model_bundle is None:
-        artifact = load_probe_artifact(model_id)
-        if artifact is not None:
-            target_model_id = artifact.model_id or model_id
-            model_bundle = get_or_load_model(target_model_id)
-
     if model_bundle is None:
         return None
 
@@ -382,5 +381,6 @@ def extract_contrastive_batch(
             metrics = extract_prefill_metrics([p_orig, p_var], tokenizer, model)
             results.append(metrics)
         return results
-    except Exception:
+    except Exception as exc:
+        print(f"[contrastive] extract_contrastive_batch failed: {exc}")
         return None

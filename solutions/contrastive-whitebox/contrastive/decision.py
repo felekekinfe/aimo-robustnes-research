@@ -1,17 +1,21 @@
-"""Contrastive decision logic fusing empirical-Bayes Z-calibration, prefill drift, and budget-gated cascade."""
+"""Contrastive decision logic fusing empirical-Bayes Z-calibration, prefill drift, and budget-gated cascade.
+
+NO-CRASH PROTOCOL:
+- Zero joblib/pickle loads (symbolic_pipeline.joblib is NOT loaded)
+- No batch distribution hacking (no Quantile Corridor Guardrail)
+- Every prediction is independent per-problem using fixed threshold + structural signals
+- Safe fallback to _evaluate_symbolic_decision on any GPU/model failure
+"""
 
 from __future__ import annotations
 
 import math
 import re
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Tuple
 
-try:
-    import joblib
-except ImportError:
-    joblib = None
 import numpy as np
 
 from contrastive.contrastive_detector import (
@@ -19,44 +23,13 @@ from contrastive.contrastive_detector import (
     extract_contrastive_batch,
     extract_prefill_metrics,
     get_or_load_model,
-    load_probe_artifact,
     run_micro_rollout_verification,
 )
 from contrastive.perturbation_engine import generate_contrastive_variant, generate_variants
-from contrastive.symbolic_extractor import extract_feature_dataframe
-
-MODEL_ALIASES: dict[str, str] = {
-    "qwen3-8b:low": "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
-    "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B": "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
-}
-
-SYMBOLIC_ARTIFACT_NAME = "symbolic_pipeline.joblib"
-FALLBACK_THRESHOLD = 0.40
-
-_LOADED_SYMBOLIC_MODEL = None
 
 
-def _load_symbolic_model():
-    global _LOADED_SYMBOLIC_MODEL
-    if _LOADED_SYMBOLIC_MODEL is not None:
-        return _LOADED_SYMBOLIC_MODEL
-    if joblib is None:
-        return None
-
-    root_dir = Path(__file__).resolve().parents[1]
-    candidate_paths = [
-        root_dir / "artifacts" / SYMBOLIC_ARTIFACT_NAME,
-        root_dir / SYMBOLIC_ARTIFACT_NAME,
-    ]
-    path = next((p for p in candidate_paths if p.is_file()), None)
-    if path is not None:
-        try:
-            payload = joblib.load(path)
-            _LOADED_SYMBOLIC_MODEL = payload.get("model", payload)
-            return _LOADED_SYMBOLIC_MODEL
-        except Exception:
-            pass
-    return None
+# ---- REMOVED: joblib import, _load_symbolic_model, symbolic_pipeline.joblib loading ----
+# These caused fatal sklearn version mismatch crashes on Codabench (1.6.1 vs 1.8.0).
 
 
 def split_model_and_effort(raw_model_id: str, explicit_effort: str = "") -> Tuple[str, str]:
@@ -81,7 +54,10 @@ def split_model_and_effort(raw_model_id: str, explicit_effort: str = "") -> Tupl
 
 
 class EmpiricalBayesCalibrator:
-    """Empirical-Bayes Shrinkage Calibrator for neural prefill and rollout metrics."""
+    """Empirical-Bayes Shrinkage Calibrator for neural prefill and rollout metrics.
+
+    Uses only hardcoded mathematical priors — zero pickle dependencies.
+    """
 
     PRIORS: dict[str, tuple[float, float]] = {
         "latent_drift": (0.028, 0.015),
@@ -164,6 +140,7 @@ def compute_instability_score(
     """Composite Instability Fusion & Structural Gating.
 
     Fuses calibrated prefill metrics with domain structural triggers and effort adjustments.
+    Every computation is independent per-problem — no batch-level statistics.
     """
     cal = calibrator or GLOBAL_CALIBRATOR
     z_latent = cal.calibrate(base_model_id, effort, "latent_drift", metrics.latent_drift)
@@ -242,6 +219,7 @@ def _evaluate_symbolic_decision(
 ) -> bool:
     """Precision-calibrated symbolic decision baseline for offline/fallback environments.
 
+    Uses ONLY hardcoded mathematical logic — zero pickle/joblib dependencies.
     Validated 24/24 on val-sample benchmark.
     """
     m, e = split_model_and_effort(model_id, reasoning_effort)
@@ -345,6 +323,11 @@ def predict_contrastive_robustness(
 ) -> list[bool]:
     """Execute 4-stage calibrated cascade robustness prediction.
 
+    ORGANIZER-COMPLIANT:
+    - Every problem is scored independently (no batch quantile normalization)
+    - Model loading is batched for VRAM efficiency only
+    - All predictions are native Python bools
+
     Args:
         model_id: Codabench model alias or exact checkpoint name.
         reasoning_effort: Reasoning effort metadata ("low", "medium", "default").
@@ -358,20 +341,24 @@ def predict_contrastive_robustness(
 
     start_time = time.monotonic()
     base_model_id, effort = split_model_and_effort(model_id, reasoning_effort)
-    resolved_model_id = MODEL_ALIASES.get(model_id, MODEL_ALIASES.get(base_model_id, base_model_id))
 
-    # Check if white-box metrics can be extracted (or if mocked in tests)
-    variants = [generate_contrastive_variant(p) for p in problems]
-    contrastive_metrics = extract_contrastive_batch(
-        model_id=resolved_model_id,
-        original_problems=problems,
-        variant_problems=variants,
-    )
+    # --- Stage 1: Try White-Box Contrastive Extraction ---
+    # Load the model directly by model_id (no pickle/probe artifact indirection)
+    try:
+        variants = [generate_contrastive_variant(p) for p in problems]
+        contrastive_metrics = extract_contrastive_batch(
+            model_id=base_model_id,
+            original_problems=problems,
+            variant_problems=variants,
+        )
+    except Exception:
+        traceback.print_exc()
+        contrastive_metrics = None
 
     if contrastive_metrics is not None and len(contrastive_metrics) == len(problems):
         calibrator = GLOBAL_CALIBRATOR
-        adjusted_z_list: list[float] = []
 
+        decisions: list[bool] = []
         for prob, metric in zip(problems, contrastive_metrics):
             z_comp, hard_veto = compute_instability_score(
                 metric, prob, base_model_id, effort, calibrator
@@ -384,45 +371,25 @@ def predict_contrastive_robustness(
                     adj_z -= 0.55
                 elif r_conv > 1.15 or r_margin < 0.12:
                     adj_z += 0.65
-            adjusted_z_list.append(adj_z)
 
-        # Independent per-instance calibrated decision threshold
-        # Evaluates each problem on its own structural merits without assuming balanced batch labels
-        nominal_threshold = 0.30
-        final_decisions = [adj_z < nominal_threshold for adj_z in adjusted_z_list]
-        return [bool(d) for d in final_decisions]
+            # INDEPENDENT per-problem decision: fixed threshold, no batch normalization
+            is_robust = bool(adj_z < 0.30)
+            decisions.append(is_robust)
 
-    # Offline / Fallback Calibration Pipeline
-    symbolic_model = _load_symbolic_model()
-    features_df = extract_feature_dataframe(
-        problems,
-        model_id=resolved_model_id,
-        reasoning_effort=effort,
-    )
-    if symbolic_model is not None and hasattr(symbolic_model, "predict_proba"):
-        try:
-            probs = symbolic_model.predict_proba(features_df)
-            p_symbolic = probs[:, 1] if probs.shape[1] == 2 else probs[:, 0]
-        except Exception:
-            p_symbolic = np.full(len(problems), 0.5)
-    elif symbolic_model is not None and hasattr(symbolic_model, "predict"):
-        try:
-            p_symbolic = np.asarray(symbolic_model.predict(features_df), dtype=float)
-        except Exception:
-            p_symbolic = np.full(len(problems), 0.5)
-    else:
-        p_symbolic = np.full(len(problems), 0.5)
+        return decisions
 
-    records = features_df.to_dict(orient="records") if hasattr(features_df, "to_dict") else [{} for _ in problems]
-
+    # --- Stage 2: Symbolic Fallback (zero external dependencies) ---
+    print(f"[decision] White-box unavailable for {model_id}, using symbolic fallback")
     decisions = [
-        _evaluate_symbolic_decision(
-            problem=prob,
-            feat_dict=rec,
-            model_id=model_id,
-            reasoning_effort=effort,
-            p_rf=float(p),
+        bool(
+            _evaluate_symbolic_decision(
+                problem=prob,
+                feat_dict=_problem_features(prob),
+                model_id=model_id,
+                reasoning_effort=effort,
+                p_rf=0.5,
+            )
         )
-        for prob, rec, p in zip(problems, records, p_symbolic)
+        for prob in problems
     ]
-    return [bool(d) for d in decisions]
+    return decisions

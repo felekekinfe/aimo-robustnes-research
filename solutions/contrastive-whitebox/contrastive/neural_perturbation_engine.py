@@ -57,7 +57,10 @@ def generate_neural_variants(
         tokenizer.padding_side = "left"
         pad_token_id = getattr(tokenizer, "pad_token_id", None) or getattr(tokenizer, "eos_token_id", None)
         enc = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
-        device = getattr(model, "device", "cpu")
+        try:
+            device = next(model.parameters()).device
+        except Exception:
+            device = getattr(model, "device", "cpu")
         enc = {k: v.to(device) for k, v in enc.items()}
 
         with torch.inference_mode():
