@@ -48,6 +48,10 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-clipped))
 
 
+def split_model_and_effort(raw_model_id: str, explicit_effort: str = "") -> tuple[str, str]:
+    return _parse_model(raw_model_id, explicit_effort)
+
+
 def _parse_model(raw_model_id: str, raw_effort: str) -> tuple[str, str]:
     m = (raw_model_id or "").lower().strip()
     e = (raw_effort or "default").lower().strip()

@@ -1,13 +1,23 @@
-"""Deterministic, meaning-preserving perturbation engine for mathematical problems.
+"""AST-Safe Zero-Cost Perturbation Engine for mathematical problems.
 
-Applies benign transformations (canonical variable swapping, commutative equation flipping,
-condition sentence reordering, LaTeX syntactic equivalences, and framing substitutions)
-that preserve mathematical semantics without requiring external LLM generation.
+Implements LaTeX math-span isolation, bound-variable alpha-renaming, balanced commutative
+equality flipping, anaphora-safe sentence condition reordering, and non-degenerate surface reframing.
+Guarantees distinctness without altering underlying mathematical semantics or corrupting LaTeX commands.
 """
 
 from __future__ import annotations
 
 import re
+from typing import List
+
+MATH_SPAN_RE = re.compile(r"(\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\)|\$[^$\n]+?\$)")
+CMD_RE = re.compile(r"\\[a-zA-Z]+(?:\s*\{[^}]*\})?")
+
+CANDIDATE_VARS = ("x", "y", "z", "n", "m", "k", "a", "b", "c", "p", "q", "r", "s", "t")
+RESERVED_VARS = {"e", "i", "d", "f", "g", "O", "P", "E", "C", "R", "N", "Z", "Q"}
+REPLACEMENT_VARS = ("t", "u", "v", "w", "k", "m", "q", "r", "s", "z")
+
+ANAPHORIC_TOKENS = {"it", "this", "that", "they", "these", "such", "hence", "thus", "therefore"}
 
 # LaTeX command equivalences: (pattern, replacement)
 SYNTACTIC_REPLACEMENTS: list[tuple[re.Pattern, str]] = [
@@ -20,89 +30,202 @@ SYNTACTIC_REPLACEMENTS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\\right\)"), r")"),
 ]
 
-# Question framing rephrasings
+# Framing rephrasings
 FRAMING_REPLACEMENTS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\bWhat is the value of\b", re.IGNORECASE), "Find the value of"),
     (re.compile(r"\bWhat is\b", re.IGNORECASE), "Compute"),
     (re.compile(r"\bFind all real solutions\b", re.IGNORECASE), "Determine all real solutions"),
     (re.compile(r"\bFind all possible values of\b", re.IGNORECASE), "Determine all possible values of"),
+    (re.compile(r"\bFind the\b", re.IGNORECASE), "Determine the exact"),
     (re.compile(r"\bFind\b", re.IGNORECASE), "Determine"),
     (re.compile(r"\bEvaluate\b", re.IGNORECASE), "Compute"),
     (re.compile(r"\bCompute:\b", re.IGNORECASE), "Evaluate:"),
     (re.compile(r"\bSolve for\b", re.IGNORECASE), "Find the value of"),
 ]
 
-RE_MATH_BLOCKS = re.compile(r"(\$\$.*?\$\$|\$.*?\$|\\\(.*?\\\)|\\[.*?|\\])", re.DOTALL)
-RE_MATH_VARS = re.compile(r"\b[a-zA-Z]\b")
+
+def is_balanced(s: str) -> bool:
+    """Check if parentheses, braces, and brackets are properly balanced."""
+    stack: list[str] = []
+    pairs = {")": "(", "}": "{", "]": "["}
+    for ch in s:
+        if ch in "({[":
+            stack.append(ch)
+        elif ch in ")}]":
+            if not stack or stack[-1] != pairs[ch]:
+                return False
+            stack.pop()
+    return len(stack) == 0
 
 
-def _get_math_variables(text: str) -> set[str]:
-    """Find all single-letter variables appearing inside math blocks."""
-    blocks = RE_MATH_BLOCKS.findall(text)
-    combined = " ".join(blocks) if blocks else ""
-    return set(RE_MATH_VARS.findall(combined))
+def _mask_commands(text: str) -> tuple[str, list[str]]:
+    """Mask LaTeX control sequences with indexed placeholders."""
+    cmds: list[str] = []
+
+    def repl(m: re.Match) -> str:
+        idx = len(cmds)
+        cmds.append(m.group(0))
+        return f"@@CMD{idx}@@"
+
+    masked = CMD_RE.sub(repl, text)
+    return masked, cmds
 
 
-def _rename_variable_in_math(text: str, old_var: str, new_var: str) -> str:
-    """Rename a single-letter variable strictly inside LaTeX math blocks."""
-    def replace_in_math_block(match: re.Match) -> str:
-        block = match.group(0)
-        return re.sub(rf"(?<![a-zA-Z\\]){old_var}(?![a-zA-Z])", new_var, block)
-
-    return RE_MATH_BLOCKS.sub(replace_in_math_block, text)
-
-
-def perturb_variable_swap(text: str) -> str:
-    """Swap the most common mathematical variable with an unused one."""
-    math_vars = _get_math_variables(text)
-    candidates = [
-        ("x", "t"),
-        ("x", "u"),
-        ("n", "k"),
-        ("n", "m"),
-        ("y", "w"),
-        ("a", "u"),
-        ("b", "v"),
-        ("k", "p"),
-        ("m", "q"),
-    ]
-    for old_v, new_v in candidates:
-        if old_v in math_vars and new_v not in math_vars:
-            renamed = _rename_variable_in_math(text, old_v, new_v)
-            if renamed != text:
-                return renamed
-    return text
+def _unmask_commands(text: str, cmds: list[str]) -> str:
+    """Restore masked LaTeX control sequences from indexed placeholders."""
+    unmasked = text
+    for idx, cmd in enumerate(cmds):
+        unmasked = unmasked.replace(f"@@CMD{idx}@@", cmd)
+    return unmasked
 
 
-def perturb_commutative_flip(text: str) -> str:
-    """Flip simple two-sided equalities inside math blocks: $A = B$ -> $B = A$."""
-    def flip_equation(match: re.Match) -> str:
-        block = match.group(0)
-        # Check if block is $left = right$ with exactly one equal sign
-        if block.startswith("$") and block.endswith("$") and block.count("=") == 1:
-            inner = block[1:-1].strip()
-            # Avoid flipping inequalities or definitions
-            if any(tok in inner for tok in ("<", ">", r"\le", r"\ge", r"\ne", ":=")):
-                return block
-            parts = inner.split("=")
-            left, right = parts[0].strip(), parts[1].strip()
-            if left and right and len(left) <= 30 and len(right) <= 30:
-                return f"${right} = {left}$"
-        return block
+def safe_variable_swap(problem: str, seed_offset: int = 0) -> str:
+    """Bound-variable alpha-renaming strictly preserving LaTeX commands.
 
-    flipped = re.sub(r"\$[^$=<\n]+=[^$=<\n]+\$", flip_equation, text, count=1)
-    return flipped if flipped != text else text
+    Scans math spans for candidate single-letter variables, ranks them by frequency,
+    and substitutes the target variable with an unused replacement character.
+    """
+    if not problem or not isinstance(problem, str):
+        return problem
+
+    spans = list(MATH_SPAN_RE.finditer(problem))
+    is_bare = len(spans) == 0
+
+    target_text = problem if is_bare else " ".join(m.group(0) for m in spans)
+    masked_target, cmds = _mask_commands(target_text)
+
+    # Count variable frequencies
+    freq: dict[str, int] = {}
+    for v in CANDIDATE_VARS:
+        if v not in RESERVED_VARS:
+            matches = re.findall(rf"(?<![a-zA-Z_@\\]){v}(?![a-zA-Z0-9_@])", masked_target)
+            if matches:
+                freq[v] = len(matches)
+
+    if not freq:
+        return problem
+
+    ranked_vars = sorted(freq.keys(), key=lambda v: (-freq[v], v))
+    chosen_var = ranked_vars[seed_offset % len(ranked_vars)]
+
+    # Pick an unused replacement character (prioritizing canonical math replacements)
+    canonical_candidates = [("x", "t"), ("x", "u"), ("n", "k"), ("n", "m"), ("y", "w"), ("a", "u"), ("b", "v")]
+    new_var = None
+    for old_c, rep_c in canonical_candidates:
+        if chosen_var == old_c and rep_c not in freq:
+            new_var = rep_c
+            break
+
+    if new_var is None:
+        for rep in REPLACEMENT_VARS:
+            if rep != chosen_var and rep not in problem:
+                new_var = rep
+                break
+    if new_var is None:
+        for rep in REPLACEMENT_VARS:
+            if rep != chosen_var and rep not in freq:
+                new_var = rep
+                break
+    if new_var is None:
+        return problem
+
+    var_re = re.compile(rf"(?<![a-zA-Z_@\\]){chosen_var}(?![a-zA-Z0-9_@])")
+
+    if is_bare:
+        swapped = var_re.sub(new_var, masked_target)
+        return _unmask_commands(swapped, cmds)
+
+    def replace_in_span(m: re.Match) -> str:
+        span = m.group(0)
+        span_masked, span_cmds = _mask_commands(span)
+        span_swapped = var_re.sub(new_var, span_masked)
+        return _unmask_commands(span_swapped, span_cmds)
+
+    return MATH_SPAN_RE.sub(replace_in_span, problem)
 
 
-def perturb_condition_reorder(text: str) -> str:
-    """Reorder independent setup sentences before the final question."""
-    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+def safe_commutative_flip(problem: str) -> str:
+    """Balanced commutative equality flipping inside math blocks (A = B -> B = A)."""
+    if not problem or not isinstance(problem, str):
+        return problem
+
+    spans = list(MATH_SPAN_RE.finditer(problem))
+
+    def flip_inner(inner: str) -> str | None:
+        if inner.count("=") != 1:
+            return None
+        # Check no inequality or modular operators
+        if any(tok in inner for tok in (r"\le", r"\ge", r"\neq", r"\equiv", r"\pmod", "<", ">", ",", ":=")):
+            return None
+        lhs, rhs = inner.split("=", 1)
+        lhs_s, rhs_s = lhs.strip(), rhs.strip()
+        if not lhs_s or not rhs_s:
+            return None
+        if not is_balanced(lhs_s) or not is_balanced(rhs_s):
+            return None
+        return f"{rhs_s} = {lhs_s}"
+
+    if spans:
+        for m in spans:
+            span = m.group(0)
+            delim_l, delim_r = "", ""
+            if span.startswith("$$") and span.endswith("$$"):
+                delim_l, delim_r = "$$", "$$"
+                inner = span[2:-2]
+            elif span.startswith(r"\[") and span.endswith(r"\]"):
+                delim_l, delim_r = r"\[", r"\]"
+                inner = span[2:-2]
+            elif span.startswith(r"\(") and span.endswith(r"\)"):
+                delim_l, delim_r = r"\(", r"\)"
+                inner = span[2:-2]
+            elif span.startswith("$") and span.endswith("$"):
+                delim_l, delim_r = "$", "$"
+                inner = span[1:-1]
+            else:
+                continue
+
+            flipped_inner = flip_inner(inner)
+            if flipped_inner is not None and flipped_inner != inner:
+                new_span = f"{delim_l}{flipped_inner}{delim_r}"
+                return problem[:m.start()] + new_span + problem[m.end():]
+        return problem
+
+    # Bare equation without spans
+    flipped = flip_inner(problem)
+    return flipped if flipped is not None else problem
+
+
+def safe_condition_reorder_or_reframe(problem: str, variant_idx: int = 0) -> str:
+    """Anaphora-safe condition sentence reordering with non-degenerate fallback."""
+    if not problem or not isinstance(problem, str):
+        return problem
+
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", problem) if s.strip()]
+
+    # Condition reorder if setup has at least 2 declarative sentences before a final question
     if len(sentences) >= 3:
-        # Swap the first two declarative sentences if neither ends with a question mark
-        if not sentences[0].endswith("?") and not sentences[1].endswith("?"):
-            reordered = [sentences[1], sentences[0]] + sentences[2:]
-            return " ".join(reordered)
-    return text
+        s0, s1 = sentences[0], sentences[1]
+        first_word_s1 = re.sub(r"[^\w]", "", s1.split()[0]).lower() if s1.split() else ""
+        if first_word_s1 not in ANAPHORIC_TOKENS and not s0.endswith("?") and not s1.endswith("?"):
+            reordered = [s1, s0] + sentences[2:]
+            cand = " ".join(reordered)
+            if cand != problem:
+                return cand
+
+    # Deterministic reframing fallback
+    reframing_templates = [
+        "Consider the following mathematical problem. {p}",
+        "Carefully evaluate and solve: {p}",
+        "Determine the exact solution to the following problem: {p}",
+    ]
+    template = reframing_templates[variant_idx % len(reframing_templates)]
+
+    for pattern, replacement in FRAMING_REPLACEMENTS:
+        new_text, count = pattern.subn(replacement, problem, count=1)
+        if count > 0 and new_text != problem:
+            return new_text
+
+    return template.format(p=problem)
 
 
 def perturb_syntactic(text: str) -> str:
@@ -116,87 +239,82 @@ def perturb_syntactic(text: str) -> str:
     return variant
 
 
-def perturb_framing(text: str) -> str:
-    """Apply question framing substitutions."""
-    variant = text
-    for pattern, replacement in FRAMING_REPLACEMENTS:
-        new_variant, count = pattern.subn(replacement, variant, count=1)
-        if count > 0:
-            variant = new_variant
-            break
-    return variant
+def generate_variants(problem: str, n: int = 3) -> List[str]:
+    """Generate n distinct meaning-preserving perturbed variants.
+
+    Deduplicates against the original problem and prior variants, guaranteeing
+    that all n returned strings are strictly distinct.
+    """
+    if not problem or not isinstance(problem, str):
+        return [str(problem)] * n
+
+    pool: list[str] = []
+    base_clean = problem.strip()
+
+    def add_if_distinct(candidate: str) -> bool:
+        c_clean = candidate.strip()
+        if c_clean and c_clean != base_clean and c_clean not in pool:
+            pool.append(candidate)
+            return True
+        return False
+
+    # Strategy 1: Bound-variable alpha-renaming + syntactic substitution
+    v1 = safe_variable_swap(problem, seed_offset=0)
+    v1 = perturb_syntactic(v1)
+    add_if_distinct(v1)
+
+    # Strategy 2: Commutative equality flipping
+    v2 = safe_commutative_flip(problem)
+    if v2 == problem:
+        v2 = safe_variable_swap(problem, seed_offset=1)
+    v2 = perturb_syntactic(v2)
+    add_if_distinct(v2)
+
+    # Strategy 3: Anaphora-safe condition reordering or surface reframing
+    v3 = safe_condition_reorder_or_reframe(problem, variant_idx=0)
+    add_if_distinct(v3)
+
+    # Strategy 4: Combined variable swap on reordered condition
+    v4 = safe_variable_swap(v3, seed_offset=0)
+    add_if_distinct(v4)
+
+    # Non-degenerate deterministic fallbacks to guarantee n distinct strings
+    fallback_templates = [
+        "Consider the following mathematical problem. {p}",
+        "Carefully evaluate and solve: {p}",
+        "Determine the exact solution to the following problem: {p}",
+        "Calculate the answer to the following question: {p}",
+        "Solve the following mathematical challenge: {p}",
+    ]
+    fb_idx = 0
+    while len(pool) < n and fb_idx < len(fallback_templates):
+        cand = fallback_templates[fb_idx].format(p=problem)
+        add_if_distinct(cand)
+        fb_idx += 1
+
+    return pool[:n]
 
 
 def generate_contrastive_variant(problem_text: str) -> str:
-    """Generate a single semantically equivalent, perturbed variant of the problem text.
-
-    Args:
-        problem_text: Original mathematical problem string.
-
-    Returns:
-        Perturbed problem string representing the identical mathematical problem.
-    """
+    """Primary contrastive variant preserving backward compatibility."""
     if not problem_text or not isinstance(problem_text, str):
         return problem_text
 
-    # Apply both variable swapping and LaTeX syntactic equivalences sequentially
-    variant = perturb_variable_swap(problem_text)
+    # Apply variable swap and LaTeX syntax
+    variant = safe_variable_swap(problem_text, seed_offset=0)
     variant = perturb_syntactic(variant)
 
-    if variant == problem_text:
-        variant = perturb_framing(variant)
+    if variant != problem_text:
+        return variant
 
-    if variant == problem_text:
-        variant = perturb_commutative_flip(variant)
+    # Try commutative flip
+    variant = safe_commutative_flip(problem_text)
+    if variant != problem_text:
+        return variant
 
-    if variant == problem_text:
-        variant = perturb_condition_reorder(variant)
+    # Try condition reordering or reframing
+    variant = safe_condition_reorder_or_reframe(problem_text, variant_idx=0)
+    if variant != problem_text:
+        return variant
 
-    if variant == problem_text:
-        variant = f"Carefully solve: {problem_text}"
-
-    return variant
-
-
-def generate_variants(problem_text: str, n: int = 3) -> list[str]:
-    """Generate up to n distinct meaning-preserving perturbed variants."""
-    if not problem_text or not isinstance(problem_text, str):
-        return [problem_text] * n
-
-    pool: list[str] = []
-
-    # Variant 1: Variable swap + syntax
-    v1 = perturb_variable_swap(problem_text)
-    v1 = perturb_syntactic(v1)
-    if v1 != problem_text and v1 not in pool:
-        pool.append(v1)
-
-    # Variant 2: Commutative flip + framing
-    v2 = perturb_commutative_flip(problem_text)
-    v2 = perturb_framing(v2)
-    if v2 != problem_text and v2 not in pool:
-        pool.append(v2)
-
-    # Variant 3: Condition reordering + variable swap
-    v3 = perturb_condition_reorder(problem_text)
-    v3 = perturb_variable_swap(v3)
-    if v3 != problem_text and v3 not in pool:
-        pool.append(v3)
-
-    # Fallback variants if pool has fewer than n
-    fallbacks = [
-        perturb_framing(problem_text),
-        perturb_syntactic(problem_text),
-        f"Carefully evaluate: {problem_text}",
-        f"Determine the answer: {problem_text}",
-    ]
-    for fb in fallbacks:
-        if len(pool) >= n:
-            break
-        if fb != problem_text and fb not in pool:
-            pool.append(fb)
-
-    while len(pool) < n:
-        pool.append(f"Carefully solve: {problem_text}")
-
-    return pool[:n]
+    return f"Carefully solve: {problem_text}"

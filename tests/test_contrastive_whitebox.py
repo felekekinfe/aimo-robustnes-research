@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 import sys
 import unittest
 from pathlib import Path
@@ -15,7 +16,8 @@ if str(SOLUTION_DIR) not in sys.path:
     sys.path.insert(0, str(SOLUTION_DIR))
 
 from contrastive.contrastive_detector import ContrastiveMetrics
-from contrastive.perturbation_engine import generate_contrastive_variant
+from contrastive.decision import EmpiricalBayesCalibrator, finalize_decision
+from contrastive.perturbation_engine import generate_contrastive_variant, generate_variants, safe_variable_swap
 
 
 def load_contrastive_solution():
@@ -103,6 +105,59 @@ class ContrastiveWhiteBoxTests(unittest.TestCase):
 
         self.assertEqual(len(results), 1)
         self.assertIs(type(results[0]), bool)
+
+    def test_latex_command_preservation(self) -> None:
+        """Verify \text{max}_{x \in S} (3x + \exp(x)) = 10 swaps bound x without altering \text{max} or \exp."""
+        p = r"\text{max}_{x \in S} (3x + \exp(x)) = 10"
+        res = safe_variable_swap(p)
+        self.assertNotEqual(p, res)
+        self.assertIn(r"\text{max}", res)
+        self.assertIn(r"\exp", res)
+        # Check that bound x in subscripts/terms was swapped to another variable
+        clean_res = res.replace(r"\exp", "").replace(r"\text{max}", "")
+        self.assertNotIn("x", clean_res)
+
+    def test_non_degenerate_variants(self) -> None:
+        """Verify generate_variants(p, n=3) returns 3 unique strings all != p on pure prose without $."""
+        p = "Alice and Bob play a token game with 1000 coins where each player takes some tokens. Who wins?"
+        variants = generate_variants(p, n=3)
+        self.assertEqual(len(variants), 3)
+        self.assertEqual(len(set(variants)), 3)
+        for v in variants:
+            self.assertNotEqual(p.strip(), v.strip())
+
+    def test_empirical_bayes_single_sample_and_batch(self) -> None:
+        """Verify EmpiricalBayesCalibrator returns finite Z-scores at N=1 and converges at N=30."""
+        cal = EmpiricalBayesCalibrator()
+        z_1 = cal.calibrate("test-model-8b", "default", "latent_drift", 0.030)
+        self.assertTrue(math.isfinite(z_1))
+
+        for i in range(29):
+            z_30 = cal.calibrate("test-model-8b", "default", "latent_drift", 0.025 + 0.0005 * (i % 5))
+        self.assertTrue(math.isfinite(z_30))
+        self.assertAlmostEqual(z_30, (0.027 - 0.026) / (0.015 * 0.85), delta=1.5)
+
+    def test_micro_rollout_self_correction_vs_collapse(self) -> None:
+        """Verify finalize_decision rescues a borderline instance on convergence and vetoes on collapse."""
+        # Borderline instance z_comp = 0.40 (without rollout would be False since >= 0.30)
+        rescued_metric = ContrastiveMetrics(
+            latent_drift=0.03,
+            used_micro_rollout=True,
+            rollout_convergence_ratio=0.65,
+            rollout_min_margin=0.30,
+        )
+        decision_rescued = finalize_decision(0.40, rescued_metric, decision_threshold=0.30)
+        self.assertTrue(decision_rescued)
+
+        # Borderline instance z_comp = 0.10 (without rollout would be True since < 0.30)
+        collapsed_metric = ContrastiveMetrics(
+            latent_drift=0.03,
+            used_micro_rollout=True,
+            rollout_convergence_ratio=1.40,
+            rollout_min_margin=0.05,
+        )
+        decision_collapsed = finalize_decision(0.10, collapsed_metric, decision_threshold=0.30)
+        self.assertFalse(decision_collapsed)
 
 
 if __name__ == "__main__":
