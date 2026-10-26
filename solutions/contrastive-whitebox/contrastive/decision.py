@@ -386,17 +386,10 @@ def predict_contrastive_robustness(
                     adj_z += 0.65
             adjusted_z_list.append(adj_z)
 
-        # Batch Quantile Corridor Guardrail (when batch size >= 12)
+        # Independent per-instance calibrated decision threshold
+        # Evaluates each problem on its own structural merits without assuming balanced batch labels
         nominal_threshold = 0.30
-        initial_preds = [adj_z < nominal_threshold for adj_z in adjusted_z_list]
-        pos_rate = sum(initial_preds) / max(1, len(initial_preds))
-
-        if len(problems) >= 12 and (pos_rate < 0.25 or pos_rate > 0.75):
-            calibrated_threshold = float(np.percentile(adjusted_z_list, 55))
-            final_decisions = [adj_z < calibrated_threshold for adj_z in adjusted_z_list]
-        else:
-            final_decisions = initial_preds
-
+        final_decisions = [adj_z < nominal_threshold for adj_z in adjusted_z_list]
         return [bool(d) for d in final_decisions]
 
     # Offline / Fallback Calibration Pipeline

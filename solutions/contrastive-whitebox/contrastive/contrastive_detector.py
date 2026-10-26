@@ -124,12 +124,19 @@ def get_or_load_model(model_id: str) -> tuple[Any, Any] | None:
         )
 
         tokenizer = AutoTokenizer.from_pretrained(model_id, local_files_only=True)
+        load_kwargs: dict[str, Any] = {
+            "torch_dtype": dtype,
+            "local_files_only": True,
+        }
+        if device == "cuda":
+            load_kwargs["device_map"] = "auto"
+
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
-            torch_dtype=dtype,
-            local_files_only=True,
+            **load_kwargs,
         )
-        model.to(device)
+        if device != "cuda":
+            model.to(device)
         model.eval()
 
         _LOADED_MODEL_ID = model_id
@@ -157,7 +164,11 @@ def extract_prefill_metrics(
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
         enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True)
-        enc = {k: v.to(model.device) for k, v in enc.items()}
+        try:
+            device = next(model.parameters()).device
+        except Exception:
+            device = getattr(model, "device", "cpu")
+        enc = {k: v.to(device) for k, v in enc.items()}
 
         with torch.inference_mode():
             out = model(**enc, output_hidden_states=True, use_cache=False)
@@ -351,12 +362,16 @@ def extract_contrastive_batch(
     variant_problems: list[str],
 ) -> list[ContrastiveMetrics] | None:
     """Extract contrastive white-box metrics for a batch of problems."""
-    artifact = load_probe_artifact(model_id)
-    if artifact is None:
-        return None
+    # 1. Try loading requested model_id directly (available in Codabench cache)
+    model_bundle = get_or_load_model(model_id)
 
-    target_model_id = artifact.model_id or model_id
-    model_bundle = get_or_load_model(target_model_id)
+    # 2. If model_id not directly loadable, check probe artifact fallback
+    if model_bundle is None:
+        artifact = load_probe_artifact(model_id)
+        if artifact is not None:
+            target_model_id = artifact.model_id or model_id
+            model_bundle = get_or_load_model(target_model_id)
+
     if model_bundle is None:
         return None
 
