@@ -211,26 +211,26 @@ def get_model_tier_base_rate(model_id: str, effort: str) -> float:
 
     # Frontier closed models (GPT-5.2, GLM-5.1)
     if "gpt-5.2" in m or "glm-5.1" in m:
-        return 0.92
+        return 0.85
     if "gemini" in m:
-        return 0.30 if e == "low" else 0.65
+        return 0.40 if e == "low" else 0.55
 
     # Massive models (120B, 397B, 70B, etc.)
     if any(t in m for t in ["120b", "397b", "70b", "72b", "gpt-oss"]):
         if e == "low":
             return 0.45
         elif e == "high":
-            return 0.85
+            return 0.75
         else:
-            return 0.70
+            return 0.60
 
     # Small/medium open models (4B, 7B, 8B)
     if e == "low":
-        return 0.25
+        return 0.40
     elif e == "high":
-        return 0.70
+        return 0.65
     else:
-        return 0.60
+        return 0.55
 
 
 def get_problem_complexity_delta(problem: str, feat_dict: dict | None = None) -> float:
@@ -250,60 +250,49 @@ def get_problem_complexity_delta(problem: str, feat_dict: dict | None = None) ->
         or f["has_acute_triangle"]
     )
     if fragile_triggers:
-        return -1.10
+        return -0.70
     if f["len"] > 450:
-        return -0.40
+        return -0.30
     if f["len"] < 200 and not f["has_triangle"]:
         return +0.30
     return 0.0
 
 
 def compute_neural_delta(metric: ContrastiveMetrics) -> float:
-    """Neural white-box representation stability delta in log-odds space."""
-    delta = 0.0
-
-    # Excess Cosine Drift
+    """Bidirectional, zero-centered white-box stability delta in log-odds space."""
+    # 1. Excess Cosine Drift (centered at 0.0015)
     ld = metric.latent_drift
-    if ld > 0.003:
-        delta -= 1.5 * min(3.0, (ld - 0.003) / 0.005)
-    elif ld < 0.001:
-        delta += 0.5 * min(1.0, (0.001 - ld) / 0.001)
+    delta_cos = -1.2 * (ld - 0.0015) / 0.0020
 
-    # Logit KL Divergence
+    # 2. Logit KL Divergence (centered at 0.030)
     kl = metric.kl_div
-    if kl > 0.05:
-        delta -= 1.2 * min(3.0, (kl - 0.05) / 0.10)
-    elif kl < 0.01:
-        delta += 0.3 * min(1.0, (0.01 - kl) / 0.01)
+    delta_kl = -0.8 * (kl - 0.030) / 0.040
 
-    # Logit Lens Divergence at 0.75L
+    # 3. Late Layer Agreement (centered at 0.72)
+    agree = getattr(metric, "late_layer_agreement", 0.72)
+    delta_agree = +0.6 * (agree - 0.72) / 0.10
+
+    # 4. Logit Lens Divergence at 0.75L
     ll = getattr(metric, "logit_lens_divergence", 0.0)
-    if ll > 0.05:
-        delta -= 0.8 * min(2.0, (ll - 0.05) / 0.10)
+    delta_ll = -0.5 * min(2.0, max(0.0, ll - 0.020) / 0.030)
 
-    # Late layer internal agreement
-    agree = getattr(metric, "late_layer_agreement", 1.0)
-    if agree < 0.85:
-        delta -= 0.6 * min(2.0, (0.85 - agree) / 0.15)
-
-    # Margin agreement check
-    if hasattr(metric, "margin_agreement") and not metric.margin_agreement:
-        delta -= 0.6
-
-    # Micro-rollout verification adjustments if available
+    # 5. Micro-rollout verification adjustments if available
+    delta_rollout = 0.0
     if metric.used_micro_rollout:
         r_conv = metric.rollout_convergence_ratio or 1.0
         r_margin = metric.rollout_min_margin or 0.0
         if r_conv < 0.85 and r_margin > 0.22:
-            delta += 0.60
+            delta_rollout = +0.60
         elif r_conv > 1.15 or r_margin < 0.12:
-            delta -= 0.80
+            delta_rollout = -0.80
 
-    # Hard veto for catastrophic divergence
-    if ld > 0.04 or kl > 0.40:
-        delta -= 5.0
+    total_delta = delta_cos + delta_kl + delta_agree + delta_ll + delta_rollout
 
-    return delta
+    # Hard veto for extreme divergence
+    if ld > 0.035 or kl > 0.35:
+        total_delta = -5.0
+
+    return max(-4.0, min(3.0, total_delta))
 
 
 def _evaluate_symbolic_probability(
