@@ -64,6 +64,7 @@ class ContrastiveMetrics:
     rel_l2_drift: float = 0.0          # Relative L2 drift ||h(P_j) - h(P_0)||_2 / ||h(P_0)||_2
     entropy_shift: float = 0.0         # Mean |H(P_0) - H(P_j)|
     late_layer_agreement: float = 1.0  # Cosine similarity between 0.75L and 1.00L on P_0
+    logit_lens_divergence: float = 0.0 # Logit-lens JSD divergence at 0.75L between P_0 and variants
     rollout_divergence: Optional[float] = None
     rollout_convergence_ratio: Optional[float] = None
     rollout_min_margin: Optional[float] = None
@@ -352,6 +353,31 @@ def extract_prefill_metrics(
         margin_disagreement = float(np.mean([abs(m - margin_orig) for m in variant_margins])) if variant_margins else 0.0
         margin_agreement = bool((margin_orig > 0.10) == (margin_variant > 0.10))
 
+        # Logit-Lens Depth Trajectory Verification:
+        # Check agreement between 0.75L commitment and 1.00L commitment across candidates
+        logit_lens_divergence = 0.0
+        try:
+            lm_head = getattr(model, "lm_head", None)
+            if lm_head is None and hasattr(model, "get_output_embeddings"):
+                lm_head = model.get_output_embeddings()
+            if lm_head is not None and hasattr(lm_head, "weight") and candidate_tensor.numel() > 0:
+                hs_75_last = torch.stack([target_hs[l_75][i, last_valid_indices[i]] for i in range(batch_size)], dim=0)
+                W_cand = lm_head.weight[candidate_tensor].to(device=hs_75_last.device, dtype=hs_75_last.dtype)
+                logits_75 = F.linear(hs_75_last, W_cand)
+                p_75 = F.softmax(logits_75 / 1.5, dim=-1).clamp(min=1e-8)
+                p_75_0 = p_75[0:1]
+                jsd_75_list = []
+                for k in range(1, batch_size):
+                    p_75_k = p_75[k:k+1]
+                    m_75 = 0.5 * (p_75_0 + p_75_k)
+                    kl_0 = (p_75_0 * (p_75_0.log() - m_75.log())).sum(dim=-1).item()
+                    kl_k = (p_75_k * (p_75_k.log() - m_75.log())).sum(dim=-1).item()
+                    jsd_75_list.append(max(0.0, 0.5 * (kl_0 + kl_k)))
+                if jsd_75_list:
+                    logit_lens_divergence = float(max(jsd_75_list))
+        except Exception:
+            pass
+
         return ContrastiveMetrics(
             latent_drift=latent_drift,
             kl_div=kl_div,
@@ -361,6 +387,7 @@ def extract_prefill_metrics(
             rel_l2_drift=rel_l2_drift,
             entropy_shift=entropy_shift,
             late_layer_agreement=late_layer_agreement,
+            logit_lens_divergence=logit_lens_divergence,
             cosine_sim=max(-1.0, min(1.0, 1.0 - latent_drift)),
             rel_l2_dist=rel_l2_drift,
             margin_orig=margin_orig,

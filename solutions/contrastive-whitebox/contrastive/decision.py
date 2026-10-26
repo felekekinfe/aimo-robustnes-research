@@ -146,9 +146,9 @@ def compute_instability_score(
     effort: str,
     calibrator: EmpiricalBayesCalibrator | None = None,
 ) -> tuple[float, bool]:
-    """Composite Instability Fusion & Structural Gating.
+    """Pure Neural Instability Fusion & Anomaly Gating.
 
-    Fuses calibrated prefill metrics with domain structural triggers and effort adjustments.
+    Fuses calibrated prefill metrics, math subspace drift, and Logit-Lens depth divergence.
     Every computation is independent per-problem — no batch-level statistics.
     """
     cal = calibrator or GLOBAL_CALIBRATOR
@@ -160,46 +160,15 @@ def compute_instability_score(
 
     z_comp = 0.35 * z_latent + 0.30 * z_math + 0.20 * z_kl + 0.10 * z_ent_shift + 0.05 * z_base_ent
 
-    f = _problem_features(problem)
-
-    # Universal structural fragility triggers
-    has_universal_trigger = bool(
-        f["has_incenter"]
-        or f["has_tikz"]
-        or f["has_heptagon"]
-        or f["has_infinite_sum"]
-        or f["has_divisor_remainder"]
-        or f["has_circ_op"]
-        or f["has_circumcircle"]
-        or f["has_functional_eq"]
-        or f["has_grid"]
-        or (f["has_bisector"] and f["has_triangle"])
-        or f["has_acute_triangle"]
-    )
-    if has_universal_trigger:
-        z_comp += 0.85
-
-    # Model capacity adjustment
-    b_lower = (base_model_id or "").lower()
-    if "4b" in b_lower:
-        z_comp += 0.20
-        if f["len"] > 320 or f["has_triangle"]:
-            z_comp += 0.45
-    elif any(tag in b_lower for tag in ("7b", "8b")):
-        if f["len"] > 450:
-            z_comp += 0.35
-
-    # Effort budget bias
-    e_clean = (effort or "default").lower()
-    if e_clean == "low":
-        z_comp += 0.45
-    elif e_clean == "high":
-        z_comp -= 0.20
+    # Logit-Lens depth trajectory penalty: intermediate commitment instability
+    ll_div = getattr(metrics, "logit_lens_divergence", 0.0)
+    if ll_div > 0.035:
+        z_comp += 0.30 * (ll_div - 0.035) / 0.025
 
     # Hard-veto fallback for extreme raw anomalies
     hard_veto = bool(
-        metrics.latent_drift > 0.10
-        or metrics.kl_div > 0.50
+        metrics.latent_drift > 0.08
+        or metrics.kl_div > 0.40
         or (not metrics.margin_agreement and metrics.latent_drift > 0.035)
     )
     if hard_veto:
