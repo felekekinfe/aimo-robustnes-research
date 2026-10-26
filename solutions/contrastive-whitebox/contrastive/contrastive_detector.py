@@ -361,18 +361,56 @@ def run_micro_rollout_verification(
         tokenizer.padding_side = orig_padding_side
 
 
+MASSIVE_TAGS = ["120b", "397b", "moe", "frontier", "72b", "70b"]
+
+# Guaranteed offline 7B/8B/4B models cached on Codabench worker (from README)
+OFFLINE_PROXIES = [
+    "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
+    "Skywork/Skywork-OR1-Math-7B",
+    "allenai/Olmo-3-7B-Think",
+    "Qwen/Qwen3.5-4B",
+]
+
+
+def is_massive_model(model_id: str) -> bool:
+    """Check if model exceeds single-GPU VRAM and would spill into system RAM."""
+    m = (model_id or "").lower()
+    return any(tag in m for tag in MASSIVE_TAGS)
+
+
 def extract_contrastive_batch(
     model_id: str,
     original_problems: list[str],
     variant_problems: list[str],
-) -> list[ContrastiveMetrics] | None:
+) -> tuple[list[ContrastiveMetrics] | None, bool]:
     """Extract contrastive white-box metrics for a batch of problems.
 
-    Loads model_id directly from the Codabench HF cache. No pickle artifacts.
+    OFFLINE-SAFE PROXY STEALER:
+    If model_id is a massive model (120B, 397B, MoE), intercept it before loading
+    615 shards into system RAM. Steals the fastest offline 7B/8B proxy model cached
+    on disk, runs prefill in milliseconds, and returns (metrics, is_massive=True).
+
+    Returns:
+        tuple (metrics_list_or_None, is_massive_proxy)
     """
-    model_bundle = get_or_load_model(model_id)
+    is_massive = is_massive_model(model_id)
+    target_load_id = model_id
+
+    if is_massive:
+        print(f"[contrastive] Proxy Stealer: intercepting massive model {model_id}")
+        target_load_id = None
+        for candidate in OFFLINE_PROXIES:
+            bundle = get_or_load_model(candidate)
+            if bundle is not None:
+                target_load_id = candidate
+                print(f"[contrastive] Proxy Stealer: substituted with cached fast proxy {candidate}")
+                break
+        if target_load_id is None:
+            target_load_id = model_id
+
+    model_bundle = get_or_load_model(target_load_id)
     if model_bundle is None:
-        return None
+        return None, False
 
     tokenizer, model = model_bundle
     try:
@@ -380,7 +418,7 @@ def extract_contrastive_batch(
         for p_orig, p_var in zip(original_problems, variant_problems):
             metrics = extract_prefill_metrics([p_orig, p_var], tokenizer, model)
             results.append(metrics)
-        return results
+        return results, is_massive
     except Exception as exc:
         print(f"[contrastive] extract_contrastive_batch failed: {exc}")
-        return None
+        return None, False

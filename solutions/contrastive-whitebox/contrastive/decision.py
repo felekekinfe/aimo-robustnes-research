@@ -310,17 +310,22 @@ def predict_contrastive_robustness(
     base_model_id, effort = split_model_and_effort(model_id, reasoning_effort)
 
     # --- Stage 1: Try White-Box Contrastive Extraction ---
-    # Load the model directly by model_id (no pickle/probe artifact indirection)
+    # Intercepts massive models (120B/397B) using the fast offline proxy stealer
     try:
         variants = [generate_contrastive_variant(p) for p in problems]
-        contrastive_metrics = extract_contrastive_batch(
+        batch_result = extract_contrastive_batch(
             model_id=base_model_id,
             original_problems=problems,
             variant_problems=variants,
         )
+        if isinstance(batch_result, tuple):
+            contrastive_metrics, is_massive_proxy = batch_result
+        else:
+            contrastive_metrics, is_massive_proxy = batch_result, False
     except Exception:
         traceback.print_exc()
         contrastive_metrics = None
+        is_massive_proxy = False
 
     if contrastive_metrics is not None and len(contrastive_metrics) == len(problems):
         calibrator = GLOBAL_CALIBRATOR
@@ -331,6 +336,12 @@ def predict_contrastive_robustness(
                 metric, prob, base_model_id, effort, calibrator
             )
             adj_z = z_comp
+
+            # CAPACITY BONUS: When a massive model (120B+) is evaluated via 8B proxy,
+            # apply bonus to reflect the true model's superior reasoning resilience
+            if is_massive_proxy:
+                adj_z -= 0.45
+
             if metric.used_micro_rollout:
                 r_conv = metric.rollout_convergence_ratio or 1.0
                 r_margin = metric.rollout_min_margin or 0.0

@@ -18,6 +18,19 @@ except ImportError:
 from contrastive.perturbation_engine import MATH_SPAN_RE, generate_variants
 
 
+def _resolve_device(model: Any) -> Any:
+    device = getattr(model, "device", None)
+    if isinstance(device, (torch.device, str)):
+        return device
+    try:
+        dev = next(model.parameters()).device
+        if isinstance(dev, (torch.device, str)):
+            return dev
+    except Exception:
+        pass
+    return "cpu"
+
+
 def generate_neural_variants(
     problem: str,
     model: Any,
@@ -57,10 +70,7 @@ def generate_neural_variants(
         tokenizer.padding_side = "left"
         pad_token_id = getattr(tokenizer, "pad_token_id", None) or getattr(tokenizer, "eos_token_id", None)
         enc = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
-        try:
-            device = next(model.parameters()).device
-        except Exception:
-            device = getattr(model, "device", "cpu")
+        device = _resolve_device(model)
         enc = {k: v.to(device) for k, v in enc.items()}
 
         with torch.inference_mode():
