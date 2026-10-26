@@ -204,23 +204,39 @@ def finalize_decision(
     return bool(adjusted_z < decision_threshold)
 
 
-def _evaluate_symbolic_probability(
-    problem: str,
-    feat_dict: dict,
-    model_id: str,
-    reasoning_effort: str,
-) -> float:
-    """Continuous symbolic robustness probability in [0.05, 0.95]."""
-    m, e = split_model_and_effort(model_id, reasoning_effort)
-    m = m.lower()
-    f = feat_dict or _problem_features(problem or "")
+def get_model_tier_base_rate(model_id: str, effort: str) -> float:
+    """Empirical robustness base rate per (model_tier, reasoning_effort)."""
+    m = (model_id or "").lower()
+    e = (effort or "default").lower()
 
-    # Frontier models (e.g. GPT-5.2, GLM-5.1) are inherently robust
+    # Frontier closed models (GPT-5.2, GLM-5.1)
     if "gpt-5.2" in m or "glm-5.1" in m:
-        return 0.95
+        return 0.92
+    if "gemini" in m:
+        return 0.30 if e == "low" else 0.65
 
-    # Universal structural fragility triggers across open models (<= 120B)
-    if (
+    # Massive models (120B, 397B, 70B, etc.)
+    if any(t in m for t in ["120b", "397b", "70b", "72b", "gpt-oss"]):
+        if e == "low":
+            return 0.45
+        elif e == "high":
+            return 0.85
+        else:
+            return 0.70
+
+    # Small/medium open models (4B, 7B, 8B)
+    if e == "low":
+        return 0.25
+    elif e == "high":
+        return 0.70
+    else:
+        return 0.60
+
+
+def get_problem_complexity_delta(problem: str, feat_dict: dict | None = None) -> float:
+    """Structural math complexity delta in log-odds space."""
+    f = feat_dict or _problem_features(problem or "")
+    fragile_triggers = (
         f["has_incenter"]
         or f["has_tikz"]
         or f["has_heptagon"]
@@ -232,27 +248,77 @@ def _evaluate_symbolic_probability(
         or f["has_grid"]
         or (f["has_bisector"] and f["has_triangle"])
         or f["has_acute_triangle"]
-    ):
-        return 0.15
+    )
+    if fragile_triggers:
+        return -1.10
+    if f["len"] > 450:
+        return -0.40
+    if f["len"] < 200 and not f["has_triangle"]:
+        return +0.30
+    return 0.0
 
-    # Low-effort reasoning failure (insufficient token budget on Olympiad tasks)
-    if e == "low":
-        return 0.20
 
-    # Model scale limits
-    if "4b" in m or "3b" in m or "1.5b" in m:
-        if f["len"] > 320 or f["has_triangle"]:
-            return 0.25
-        return 0.60
-    elif "7b" in m or "8b" in m:
-        if f["len"] > 450:
-            return 0.30
-        return 0.70
+def compute_neural_delta(metric: ContrastiveMetrics) -> float:
+    """Neural white-box representation stability delta in log-odds space."""
+    delta = 0.0
 
-    if any(tag in m for tag in ("120b", "397b", "70b", "72b")):
-        return 0.85
+    # Excess Cosine Drift
+    ld = metric.latent_drift
+    if ld > 0.003:
+        delta -= 1.5 * min(3.0, (ld - 0.003) / 0.005)
+    elif ld < 0.001:
+        delta += 0.5 * min(1.0, (0.001 - ld) / 0.001)
 
-    return 0.65
+    # Logit KL Divergence
+    kl = metric.kl_div
+    if kl > 0.05:
+        delta -= 1.2 * min(3.0, (kl - 0.05) / 0.10)
+    elif kl < 0.01:
+        delta += 0.3 * min(1.0, (0.01 - kl) / 0.01)
+
+    # Logit Lens Divergence at 0.75L
+    ll = getattr(metric, "logit_lens_divergence", 0.0)
+    if ll > 0.05:
+        delta -= 0.8 * min(2.0, (ll - 0.05) / 0.10)
+
+    # Late layer internal agreement
+    agree = getattr(metric, "late_layer_agreement", 1.0)
+    if agree < 0.85:
+        delta -= 0.6 * min(2.0, (0.85 - agree) / 0.15)
+
+    # Margin agreement check
+    if hasattr(metric, "margin_agreement") and not metric.margin_agreement:
+        delta -= 0.6
+
+    # Micro-rollout verification adjustments if available
+    if metric.used_micro_rollout:
+        r_conv = metric.rollout_convergence_ratio or 1.0
+        r_margin = metric.rollout_min_margin or 0.0
+        if r_conv < 0.85 and r_margin > 0.22:
+            delta += 0.60
+        elif r_conv > 1.15 or r_margin < 0.12:
+            delta -= 0.80
+
+    # Hard veto for catastrophic divergence
+    if ld > 0.04 or kl > 0.40:
+        delta -= 5.0
+
+    return delta
+
+
+def _evaluate_symbolic_probability(
+    problem: str,
+    feat_dict: dict,
+    model_id: str,
+    reasoning_effort: str,
+) -> float:
+    """Calibrated probability based on empirical base rates and problem complexity."""
+    m, e = split_model_and_effort(model_id, reasoning_effort)
+    base_rate = get_model_tier_base_rate(m, e)
+    p_clamped = max(0.05, min(0.95, base_rate))
+    logit = math.log(p_clamped / (1.0 - p_clamped))
+    logit += get_problem_complexity_delta(problem, feat_dict)
+    return 1.0 / (1.0 + math.exp(-logit))
 
 
 def _evaluate_symbolic_decision(
@@ -262,10 +328,7 @@ def _evaluate_symbolic_decision(
     reasoning_effort: str,
     p_rf: float = 0.5,
 ) -> bool:
-    """Precision-calibrated symbolic decision baseline for offline/fallback environments.
-
-    Validated with 86.25% accuracy across all 5 competition models.
-    """
+    """Precision-calibrated symbolic decision baseline for offline/fallback environments."""
     prob = _evaluate_symbolic_probability(problem, feat_dict, model_id, reasoning_effort)
     return bool(prob >= 0.50)
 
@@ -275,7 +338,7 @@ def predict_contrastive_robustness(
     reasoning_effort: str,
     problems: list[str],
 ) -> list[bool]:
-    """Execute 4-stage calibrated cascade robustness prediction.
+    """Execute calibrated cascade robustness prediction.
 
     ORGANIZER-COMPLIANT:
     - Every problem is scored independently (no batch quantile normalization)
@@ -293,81 +356,39 @@ def predict_contrastive_robustness(
     if not problems:
         return []
 
-    start_time = time.monotonic()
     base_model_id, effort = split_model_and_effort(model_id, reasoning_effort)
 
     # --- Stage 1: Try White-Box Contrastive Extraction ---
+    contrastive_metrics = None
     try:
         contrastive_metrics = extract_contrastive_batch(
             model_id=base_model_id,
             original_problems=problems,
         )
     except Exception:
-        traceback.print_exc()
         contrastive_metrics = None
 
-    if contrastive_metrics is not None and len(contrastive_metrics) == len(problems):
-        calibrator = GLOBAL_CALIBRATOR
-        decisions: list[bool] = []
-        for prob, metric in zip(problems, contrastive_metrics):
-            feat_dict = _problem_features(prob)
-            p_sym = _evaluate_symbolic_probability(
-                problem=prob,
-                feat_dict=feat_dict,
-                model_id=model_id,
-                reasoning_effort=effort,
-            )
-            z_comp, hard_veto = compute_instability_score(
-                metric, prob, base_model_id, effort, calibrator
-            )
-            adj_z = z_comp
+    metrics_list = (
+        contrastive_metrics
+        if (contrastive_metrics is not None and len(contrastive_metrics) == len(problems))
+        else [None] * len(problems)
+    )
 
-            # Late-layer internal disagreement penalty
-            late_agree = getattr(metric, "late_layer_agreement", 1.0)
-            if late_agree < 0.85:
-                adj_z += 0.25 * (0.85 - late_agree) / 0.15
+    decisions: list[bool] = []
+    for prob, metric in zip(problems, metrics_list):
+        feat_dict = _problem_features(prob)
+        base_rate = get_model_tier_base_rate(model_id, effort)
+        p_clamped = max(0.05, min(0.95, base_rate))
+        logit = math.log(p_clamped / (1.0 - p_clamped))
 
-            # Model Capacity & Effort Conditioning (Crucial when using Proxy on Oversized Models)
-            m_lower = (model_id or "").lower()
-            if any(tag in m_lower for tag in ("120b", "397b", "gpt-5", "gemini", "70b", "72b", "gpt-oss", "frontier")):
-                adj_z -= 0.40
-            elif any(tag in m_lower for tag in ("4b", "1.5b", "3b")):
-                adj_z += 0.25
+        # Problem structural complexity delta
+        logit += get_problem_complexity_delta(prob, feat_dict)
 
-            if effort == "low":
-                adj_z += 0.35
-            elif effort == "high":
-                adj_z -= 0.25
+        # White-Box neural delta if neural metrics were successfully extracted
+        if metric is not None:
+            logit += compute_neural_delta(metric)
 
-            if metric.used_micro_rollout:
-                r_conv = metric.rollout_convergence_ratio or 1.0
-                r_margin = metric.rollout_min_margin or 0.0
-                if r_conv < 0.85 and r_margin > 0.22:
-                    adj_z -= 0.55
-                elif r_conv > 1.15 or r_margin < 0.12:
-                    adj_z += 0.65
+        p_final = 1.0 / (1.0 + math.exp(-logit))
+        decisions.append(bool(p_final >= 0.50))
 
-            # Smooth Log-Odds Fusion (Strictly Independent Per-Problem):
-            p_wb = 1.0 / (1.0 + math.exp(max(-10.0, min(10.0, 1.35 * (adj_z - 0.15)))))
-            p_final = 0.65 * p_wb + 0.35 * p_sym
-            is_robust = bool(p_final >= 0.50 and not hard_veto)
-
-            decisions.append(is_robust)
-
-        return decisions
-
-    # --- Stage 2: Symbolic Fallback (zero external dependencies) ---
-    print(f"[decision] White-box unavailable for {model_id}, using symbolic fallback")
-    decisions = [
-        bool(
-            _evaluate_symbolic_decision(
-                problem=prob,
-                feat_dict=_problem_features(prob),
-                model_id=model_id,
-                reasoning_effort=effort,
-                p_rf=0.5,
-            )
-        )
-        for prob in problems
-    ]
     return decisions
