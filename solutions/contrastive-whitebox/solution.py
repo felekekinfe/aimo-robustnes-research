@@ -69,23 +69,11 @@ def are_robust(
     except Exception:
         traceback.print_exc()
 
-    # === FALLBACK 1: Symbolic Decision Engine (zero imports beyond stdlib+re) ===
+    # === FALLBACK 1: Shrunk Prior Decision Engine (zero heavy imports) ===
     try:
-        from contrastive.decision import _evaluate_symbolic_decision, _problem_features
-
-        fallback = [
-            bool(
-                _evaluate_symbolic_decision(
-                    problem=p,
-                    feat_dict=_problem_features(p),
-                    model_id=model_str,
-                    reasoning_effort=effort_str,
-                    p_rf=0.5,
-                )
-            )
-            for p in problems
-        ]
-        return fallback
+        from contrastive.decision import get_model_prior_log_odds
+        lo_prior = get_model_prior_log_odds(model_str, effort_str)
+        return [bool(lo_prior >= 0.0) for _ in problems]
     except Exception:
         traceback.print_exc()
 
