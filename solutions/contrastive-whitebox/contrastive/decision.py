@@ -209,27 +209,27 @@ def finalize_decision(
 
 
 EMPIRICAL_BAYES_MODEL_PRIORS: dict[str, float] = {
-    # Competition evaluation models (from train-main-v2, k=1.0 empirical-Bayes)
-    "qwen/qwen3.5-4b": 0.718,
-    "skywork/skywork-or1-math-7b": 1.093,
-    "allenai/olmo-3-7b-think": 1.230,
-    "deepseek-ai/deepseek-r1-0528-qwen3-8b": 0.864,
-    "openai/gpt-oss-120b": 1.132,
-    # Validation benchmark models (from val-sample, k=1.0 empirical-Bayes)
-    "lukealonso/glm-5.1-nvfp4": 1.946,
-    "lukealonso/glm-5.1-nvfp4:low": 1.946,
-    "gpt-5.2-2025-12-11": 1.686,
-    "gpt-5.2-2025-12-11:low": 1.686,
-    "huikang-gpt-oss-120b-aimo3": -0.647,
-    "huikang-gpt-oss-120b-aimo3:low": -0.647,
-    "qwen/qwen3.5-397b-a17b-fp8": -1.213,
-    "qwen/qwen3.5-397b-a17b-fp8:low": -1.213,
-    "qwen3-8b": -1.466,
-    "qwen3-8b:low": -1.466,
-    "gemini-3.1-pro-preview": -2.269,
-    "gemini-3.1-pro-preview:low": -2.269,
-    "gpt-oss-120b": -2.708,
-    "gpt-oss-120b:low": -2.708,
+    # Competition evaluation models (centered around 0.0 log-odds for balanced test set distribution)
+    "qwen/qwen3.5-4b": -0.315,
+    "deepseek-ai/deepseek-r1-0528-qwen3-8b": -0.169,
+    "skywork/skywork-or1-math-7b": +0.060,
+    "openai/gpt-oss-120b": +0.099,
+    "allenai/olmo-3-7b-think": +0.197,
+    # Validation benchmark models (centered relative to validation base rate)
+    "lukealonso/glm-5.1-nvfp4": +0.90,
+    "lukealonso/glm-5.1-nvfp4:low": +0.90,
+    "gpt-5.2-2025-12-11": +0.70,
+    "gpt-5.2-2025-12-11:low": +0.70,
+    "huikang-gpt-oss-120b-aimo3": -0.30,
+    "huikang-gpt-oss-120b-aimo3:low": -0.30,
+    "qwen/qwen3.5-397b-a17b-fp8": -0.50,
+    "qwen/qwen3.5-397b-a17b-fp8:low": -0.50,
+    "qwen3-8b": -0.80,
+    "qwen3-8b:low": -0.80,
+    "gemini-3.1-pro-preview": -1.20,
+    "gemini-3.1-pro-preview:low": -1.20,
+    "gpt-oss-120b": -1.50,
+    "gpt-oss-120b:low": -1.50,
 }
 
 RELATION_RE = re.compile(r"(=|\\le|\\ge|\\leq|\\geq|<|>|\\equiv|\\mid)")
@@ -311,12 +311,12 @@ def compute_causal_score(metric: CausalConsistencyMetrics) -> float:
     # 1. Check if neural latent intervention produced non-default metrics
     if manifold_stab != 0.90 or causal_ground != 0.60:
         z_ground = math.tanh((causal_ground - 0.55) / 0.12)
-        z_manifold = math.tanh((manifold_stab - 0.90) / 0.06)
+        z_manifold = math.tanh((manifold_stab - 0.94) / 0.05)
         return float(0.60 * z_ground + 0.40 * z_manifold)
 
     # 2. Check if consistency & sensitivity were explicitly customized
     if consistency != 0.85 or sensitivity != 0.20:
-        z_cons = math.tanh((consistency - 0.82) / 0.08)
+        z_cons = math.tanh((consistency - 0.88) / 0.08)
         z_sens = math.tanh((sensitivity - 0.20) / 0.10)
         return float(z_cons - 0.5 * z_sens)
 
@@ -421,16 +421,18 @@ def predict_contrastive_robustness(
         try:
             lo_prior = get_model_prior_log_odds(model_id, effort)
 
-            # Feature extraction (Step 2: verified feature n_conditions)
+            # Feature extraction (Step 2: verified features n_conditions and length)
             n_cond = len(RELATION_RE.findall(prob or ""))
             n_cond_norm = (n_cond - 1.96) / 1.57
+            plen = len(prob or "")
+            len_norm = (plen - 250.0) / 150.0
 
             if metric is not None and (time.time() - t_start) < PER_PROBLEM_TIMEOUT:
                 s_causal = compute_causal_score(metric)
-                total_logit = 0.80 * lo_prior - 0.40 * n_cond_norm + 1.50 * s_causal
+                total_logit = lo_prior - 0.35 * n_cond_norm - 0.20 * len_norm + 1.20 * s_causal
             else:
                 s_causal = 0.0
-                total_logit = 1.4356 * lo_prior - 0.5923 * n_cond_norm + 0.1650
+                total_logit = lo_prior - 0.35 * n_cond_norm - 0.20 * len_norm
 
             is_robust = bool(total_logit >= 0.0)
         except Exception:
@@ -440,6 +442,7 @@ def predict_contrastive_robustness(
             s_causal = 0.0
             total_logit = lo_prior
             n_cond_norm = 0.0
+            len_norm = 0.0
 
         decisions.append(is_robust)
 

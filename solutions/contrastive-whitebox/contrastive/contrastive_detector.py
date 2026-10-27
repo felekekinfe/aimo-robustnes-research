@@ -189,8 +189,20 @@ def _extract_single_problem_consistency(
 
             E_batch = torch.cat([E_0, E_1, E_2, E_3], dim=0)
 
+            # Properly construct aligned attention mask for batch size 4
+            attn_mask = enc_clean.get("attention_mask")
+            if attn_mask is not None:
+                attn_mask_batch = attn_mask.to(device).repeat(4, 1)
+            else:
+                attn_mask_batch = torch.ones(4, seq_len, device=device, dtype=torch.long)
+
             with torch.inference_mode():
-                out = model(inputs_embeds=E_batch, output_hidden_states=True, use_cache=False)
+                out = model(
+                    inputs_embeds=E_batch,
+                    attention_mask=attn_mask_batch,
+                    output_hidden_states=True,
+                    use_cache=False,
+                )
 
             hs_last = out.hidden_states[-1][:, -1, :].float()  # [4, d]
             h_clean = hs_last[0]

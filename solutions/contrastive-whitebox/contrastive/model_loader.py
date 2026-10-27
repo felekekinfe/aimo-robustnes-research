@@ -26,7 +26,6 @@ OVERSIZED_TAGS = (
 
 SAFE_OFFLINE_PROXIES = (
     "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B",
-    "Qwen/Qwen2.5-Math-7B-Instruct",
     "Skywork/Skywork-OR1-Math-7B",
     "allenai/Olmo-3-7B-Think",
     "Qwen/Qwen3.5-4B",
@@ -107,10 +106,15 @@ def _load_model_direct(model_id: str) -> tuple[Any, Any] | None:
             trust_remote_code=True,
         )
         load_kwargs: dict[str, Any] = {
-            "torch_dtype": dtype,
             "local_files_only": True,
             "trust_remote_code": True,
         }
+        if "gpt-oss-120b" in model_id.lower():
+            # openai/gpt-oss-120b is cached in MXFP4 form; load natively
+            load_kwargs["torch_dtype"] = "auto"
+        else:
+            load_kwargs["torch_dtype"] = dtype
+
         if device == "cuda":
             load_kwargs["device_map"] = "auto"
 
