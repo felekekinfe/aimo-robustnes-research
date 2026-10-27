@@ -14,6 +14,11 @@ from contrastive.perturbation_engine import (
     generate_evolutionary_variants,
     generate_variants,
 )
+from contrastive.symbolic_extractor import (
+    FormalMathAST,
+    extract_formal_ast,
+    get_math_and_story_token_indices,
+)
 
 __all__ = [
     "predict_contrastive_robustness",
@@ -26,4 +31,7 @@ __all__ = [
     "generate_variants",
     "build_perturbation_triplet",
     "get_or_load_model",
+    "FormalMathAST",
+    "extract_formal_ast",
+    "get_math_and_story_token_indices",
 ]

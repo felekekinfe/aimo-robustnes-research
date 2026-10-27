@@ -266,34 +266,55 @@ def get_problem_complexity_delta(problem: str, feat_dict: dict | None = None) ->
         delta -= 0.15
     if f["len"] < 180 and not f["has_triangle"] and not f["has_divisor_remainder"]:
         delta += 0.25
+
+    try:
+        from contrastive.symbolic_extractor import extract_formal_ast
+        ast = extract_formal_ast(problem or "")
+        if ast.has_cyclic_symmetry:
+            delta += 0.15
+        if ast.constraint_density > 0.45:
+            delta += 0.10
+    except Exception:
+        pass
+
     return max(-0.60, min(0.60, delta))
 
 
 def compute_causal_score(metric: CausalConsistencyMetrics) -> float:
     """Compute causal mechanics competence score s_causal.
 
-    High consistency (stylistic framing resistance) -> +Robust
-    High sensitivity (logical perturbation awareness) -> -0.5 penalty if overly fragile
+    Pillar 1: Manifold Stability (latent shock resistance).
+    Pillar 3: Causal Grounding Ratio (logic-driven vs story-driven).
     """
+    manifold_stab = getattr(metric, "manifold_stability", 0.90)
+    causal_ground = getattr(metric, "causal_grounding_ratio", 0.60)
     consistency = getattr(metric, "consistency", 0.85)
     sensitivity = getattr(metric, "sensitivity", 0.20)
 
-    # Backward compatibility with legacy/mocked ContrastiveMetrics:
-    if consistency == 0.85 and sensitivity == 0.20:
-        cg = getattr(metric, "causal_grounding_jsd", None)
-        sc = getattr(metric, "spectral_compression", None)
-        le = getattr(metric, "late_erank", None)
-        if cg is not None and cg != 0.08:
-            return float(math.tanh((cg - 0.08) / 0.04))
-        if sc is not None and sc != 0.05:
-            return float(math.tanh((sc - 0.05) / 0.03))
-        if le is not None and le != 0.60:
-            return float(math.tanh((0.65 - le) / 0.10))
+    # 1. Check if neural latent intervention produced non-default metrics
+    if manifold_stab != 0.90 or causal_ground != 0.60:
+        z_ground = math.tanh((causal_ground - 0.55) / 0.12)
+        z_manifold = math.tanh((manifold_stab - 0.90) / 0.06)
+        return float(0.60 * z_ground + 0.40 * z_manifold)
 
-    z_cons = math.tanh((consistency - 0.82) / 0.08)
-    z_sens = math.tanh((sensitivity - 0.20) / 0.10)
-    s_causal = z_cons - 0.5 * z_sens
-    return float(s_causal)
+    # 2. Check if consistency & sensitivity were explicitly customized
+    if consistency != 0.85 or sensitivity != 0.20:
+        z_cons = math.tanh((consistency - 0.82) / 0.08)
+        z_sens = math.tanh((sensitivity - 0.20) / 0.10)
+        return float(z_cons - 0.5 * z_sens)
+
+    # 3. Backward compatibility with legacy/mocked ContrastiveMetrics:
+    cg = getattr(metric, "causal_grounding_jsd", None)
+    sc = getattr(metric, "spectral_compression", None)
+    le = getattr(metric, "late_erank", None)
+    if cg is not None and cg != 0.08:
+        return float(math.tanh((cg - 0.08) / 0.04))
+    if sc is not None and sc != 0.05:
+        return float(math.tanh((sc - 0.05) / 0.03))
+    if le is not None and le != 0.60:
+        return float(math.tanh((0.65 - le) / 0.10))
+
+    return 0.0
 
 
 # Backward compatibility alias

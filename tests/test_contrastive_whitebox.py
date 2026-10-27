@@ -289,5 +289,62 @@ class ContrastiveWhiteBoxTests(unittest.TestCase):
         self.assertGreater(score_robust, score_fragile)
 
 
+    def test_symbolic_extractor_formal_ast(self) -> None:
+        """Verify formal AST extraction parses variables, equations, and math char spans."""
+        from contrastive.symbolic_extractor import extract_formal_ast
+
+        problem = "Let $x, y$ be positive integers such that $x^2 + y^2 = 25$ and $x + y = 7$. Find $xy$."
+        ast = extract_formal_ast(problem)
+
+        self.assertIn("x", ast.variables)
+        self.assertIn("y", ast.variables)
+        self.assertTrue(len(ast.equations) >= 2)
+        self.assertTrue(len(ast.math_char_spans) >= 2)
+        self.assertTrue(len(ast.story_char_spans) >= 1)
+        self.assertGreater(ast.constraint_density, 0.0)
+
+    def test_token_span_mapping(self) -> None:
+        """Verify token span mapper partitions prompt into non-empty math and story token indices."""
+        from contrastive.symbolic_extractor import extract_formal_ast, get_math_and_story_token_indices
+
+        problem = "In $\\triangle ABC$, $AB = 5$. Compute the area."
+        ast = extract_formal_ast(problem)
+
+        # Mock tokenizer with simple encode/decode
+        class MockTokenizer:
+            def encode(self, text, add_special_tokens=True):
+                return list(range(len(text.split())))
+            def decode(self, token_ids):
+                return "token"
+
+        tok = MockTokenizer()
+        math_idx, story_idx = get_math_and_story_token_indices(tok, problem, ast.math_char_spans)
+        self.assertTrue(len(math_idx) > 0)
+        self.assertTrue(len(story_idx) > 0)
+
+    def test_latent_manifold_stability_and_grounding_score(self) -> None:
+        """Verify latent manifold stability and causal grounding ratio drive robustness score."""
+        from contrastive.contrastive_detector import CausalConsistencyMetrics
+        from contrastive.decision import compute_causal_score
+
+        # Robust model: high manifold stability (0.97) + high causal grounding (0.75)
+        m_robust = CausalConsistencyMetrics(
+            manifold_stability=0.97,
+            causal_grounding_ratio=0.75,
+        )
+        # Fragile model: chaotic manifold (0.78) + story-bound grounding (0.35)
+        m_fragile = CausalConsistencyMetrics(
+            manifold_stability=0.78,
+            causal_grounding_ratio=0.35,
+        )
+
+        s_robust = compute_causal_score(m_robust)
+        s_fragile = compute_causal_score(m_fragile)
+
+        self.assertGreater(s_robust, 0.0)
+        self.assertLess(s_fragile, 0.0)
+        self.assertGreater(s_robust, s_fragile)
+
+
 if __name__ == "__main__":
     unittest.main()

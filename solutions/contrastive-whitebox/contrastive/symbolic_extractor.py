@@ -1,310 +1,237 @@
-"""Model-Conditioned Symbolic & Structural Feature Extractor for Math Problems.
+"""Symbolic Extractor: Formal Mathematical Parser & Token-Span Mapper.
 
-Extracts 35 deterministic numerical features capturing:
-1. Textual scale and complexity (lengths, word counts).
-2. LaTeX and mathematical markup density.
-3. Deep algebraic and relational structures (equations, inequalities, variables, powers).
-4. Recurrence sequences and syntactic nesting depth.
-5. Numeric magnitude and Diophantine / integer constraints.
-6. Problem domain signals (geometry, number theory, combinatorics, algebra).
-7. Goal phrasing heuristics (finding vs proving).
-8. Model capacity & compute budget priors (log parameter scale, reasoning effort scale, capacity-to-load ratio).
+Pillar 2 of Neuro-Symbolic Causal AI:
+- Deterministic extraction of formal mathematical AST (equations, variables, relations).
+- Exact character interval partitioning: Formal Math Constraints (G) vs Narrative Story (S).
+- Token-level alignment mapping character intervals to token positions in input_ids.
+- Invariant structural analysis (geometry, number theory, symmetry, diophantine equations).
 """
 
 from __future__ import annotations
 
-import math
 import re
-from collections.abc import Sequence
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, List, Set, Tuple
 
-import numpy as np
-import pandas as pd
 
-SYMBOLIC_FEATURE_NAMES: tuple[str, ...] = (
-    # Textual scale
-    "char_count",
-    "word_count",
-    "line_count",
-    "avg_word_length",
-    # LaTeX & Math markup density
-    "math_delimiter_count",
-    "math_char_ratio",
-    "latex_command_count",
-    "fraction_count",
-    "sqrt_count",
-    "sum_prod_int_count",
-    "binom_count",
-    "subscript_count",
-    "superscript_count",
-    # Algebraic & Relational structure
-    "equal_sign_count",
-    "inequality_sign_count",
-    "relation_count",
-    "distinct_variable_count",
-    "degrees_of_freedom",
-    "max_bracket_depth",
-    "has_recurrence",
-    # Numeric & Diophantine characteristics
-    "number_count",
-    "max_number_magnitude",
-    "has_float",
-    "has_integer_constraint",
-    # Domain keywords heuristics
-    "has_geometry_keyword",
-    "has_number_theory_keyword",
-    "has_combinatorics_keyword",
-    "has_algebra_keyword",
-    # Goal type heuristics
-    "has_find_evaluate",
-    "has_prove",
-    "question_mark_count",
-    # Narrative & Word problem indicators
-    "narrative_step_count",
-    "is_word_problem",
-    "subscript_density",
-    # Cognitive load & Model-conditioned priors
-    "cognitive_load",
-    "model_param_log",
-    "reasoning_effort_scale",
-    "capacity_to_load_ratio",
+MATH_DELIM_RE = re.compile(
+    r"(\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\)|\$[^$\n]+?\$)"
 )
+VARIABLE_RE = re.compile(r"(?<![\\a-zA-Z])([a-zA-Z])(?![a-zA-Z])")
+RELATION_RE = re.compile(r"(=|\\le|\\ge|\\leq|\\geq|<|>|\\equiv|\\mid|\\approx|\\neq)")
+NUMBER_RE = re.compile(r"\b\d+(?:\.\d+)?\b")
 
-# Precompiled regexes
-RE_MATH_BLOCKS = re.compile(r"(\$\$.*?\$\$|\$.*?\$|\\\(.*?\\\)|\\[.*?|\\])", re.DOTALL)
-RE_LATEX_COMMAND = re.compile(r"\\[a-zA-Z]+")
-RE_NUMBERS = re.compile(r"\b\d+(?:\.\d+)?\b")
-RE_VARIABLES = re.compile(r"\b[a-zA-Z]\b")
+GEOMETRY_KEYWORDS = {
+    "triangle", "circle", "radius", "diameter", "circumcircle", "incenter",
+    "centroid", "orthocenter", "perpendicular", "parallel", "angle", "polygon",
+    "quadrilateral", "tangent", "chord", "hypotenuse", "vertex", "vertices",
+    "collinear", "concyclic", "bisector", "area", "perimeter", "sphere",
+}
 
-RE_GEOMETRY = re.compile(
-    r"\b(triangle|circle|angle|radius|diameter|perimeter|area|polygon|vertex|vertices|quadrilateral|tangent|chord|secant|sphere|cone|cylinder|hypotenuse)\b",
-    re.IGNORECASE,
-)
-RE_NUMBER_THEORY = re.compile(
-    r"\b(prime|divisor|divisors|divisible|divides|modulo|mod|gcd|lcm|remainder|congruent|integers?|factorization)\b",
-    re.IGNORECASE,
-)
-RE_COMBINATORICS = re.compile(
-    r"\b(permutation|permutations|combination|combinations|probability|ways|arrangements?|choose|subset|subsets|graph|vertices|edges)\b",
-    re.IGNORECASE,
-)
-RE_ALGEBRA = re.compile(
-    r"\b(polynomial|polynomials|roots?|coefficients?|quadratic|cubic|function|functions|inequality|system of equations|matrix|determinant)\b",
-    re.IGNORECASE,
-)
-RE_FIND_EVALUATE = re.compile(
-    r"\b(find|evaluate|determine|compute|calculate|what is|how many|value of)\b",
-    re.IGNORECASE,
-)
-RE_PROVE = re.compile(
-    r"\b(prove|show that|demonstrate)\b",
-    re.IGNORECASE,
-)
-RE_RECURRENCE = re.compile(
-    r"([a-zA-Z])_\{?[nki]\s*[+-]\s*\d+\}?|recurrence|fibonacci|defined as follows",
-    re.IGNORECASE,
-)
-RE_INTEGER_CONSTRAINT = re.compile(
-    r"\b(integer|integers|positive integer|whole number|divisible by|multiple of)\b",
-    re.IGNORECASE,
-)
-RE_NARRATIVE_STEPS = re.compile(
-    r"\b(then|after|before|each|every|remaining|erases?|writes?|operates?|schedule|flights?|airline|board|consecutive|regardless)\b",
-    re.IGNORECASE,
-)
+NUMBER_THEORY_KEYWORDS = {
+    "prime", "primes", "divisible", "divisor", "divisors", "gcd", "lcm",
+    "modular", "modulo", "mod", "congruent", "congruence", "remainder",
+    "integer", "integers", "coprime", "diophantine", "factorization",
+}
 
 
-def parse_model_param_log(model_id: str) -> float:
-    """Extract approximate log10 parameter scale (in billions) from model identifier."""
-    if not model_id or not isinstance(model_id, str):
-        return 0.9031  # Default to ~8B
-    m_lower = model_id.lower()
-    match = re.search(r"(\d+)\s*b\b", m_lower)
-    if match:
-        params_b = float(match.group(1))
-    elif "gpt-5" in m_lower:
-        params_b = 500.0
-    elif "gemini" in m_lower:
-        params_b = 100.0
-    elif "glm" in m_lower:
-        params_b = 50.0
-    else:
-        params_b = 8.0
-    return float(math.log10(max(1.0, params_b)))
+@dataclass
+class FormalMathAST:
+    """Formal mathematical Abstract Syntax Tree representation of a problem."""
+    variables: list[str] = field(default_factory=list)
+    equations: list[str] = field(default_factory=list)
+    relations: list[str] = field(default_factory=list)
+    numbers: list[str] = field(default_factory=list)
+    math_char_spans: list[tuple[int, int]] = field(default_factory=list)
+    story_char_spans: list[tuple[int, int]] = field(default_factory=list)
+    constraint_density: float = 0.0
+    is_geometry: bool = False
+    is_number_theory: bool = False
+    is_algebra: bool = False
+    has_cyclic_symmetry: bool = False
+    is_diophantine: bool = False
+    raw_problem: str = ""
 
 
-def parse_reasoning_effort_scale(reasoning_effort: str) -> float:
-    """Map reasoning effort string to a continuous budget scale in [0.0, 1.0]."""
-    if not reasoning_effort or not isinstance(reasoning_effort, str):
-        return 0.50
-    effort_lower = reasoning_effort.lower().strip()
-    mapping = {
-        "low": 0.33,
-        "medium": 0.66,
-        "high": 1.00,
-        "default": 0.50,
-    }
-    return mapping.get(effort_lower, 0.50)
+def extract_formal_ast(problem: str) -> FormalMathAST:
+    """Parse problem text into formal mathematical AST without external heavy binaries."""
+    if not problem or not isinstance(problem, str):
+        return FormalMathAST(raw_problem=str(problem or ""))
 
+    raw = problem.strip()
+    n_chars = len(raw)
+    if n_chars == 0:
+        return FormalMathAST()
 
-def compute_max_bracket_depth(text: str) -> float:
-    """Compute maximum syntactic nesting depth of brackets, parentheses, and braces."""
-    current = 0
-    max_d = 0
-    for ch in text:
-        if ch in "({[":
-            current += 1
-            if current > max_d:
-                max_d = current
-        elif ch in ")}]":
-            if current > 0:
-                current -= 1
-    return float(max_d)
+    # 1. Identify all formal math spans (G) and their exact char spans
+    math_matches = list(MATH_DELIM_RE.finditer(raw))
+    math_char_spans: list[tuple[int, int]] = [m.span() for m in math_matches]
 
+    # If no LaTeX delimiters present, find standalone equations/numbers
+    if not math_char_spans:
+        for m in re.finditer(r"\b[a-zA-Z]\s*=\s*[-+]?\d+\b", raw):
+            math_char_spans.append(m.span())
+        if not math_char_spans:
+            for m in NUMBER_RE.finditer(raw):
+                math_char_spans.append(m.span())
 
-def extract_symbolic_features(
-    text: str,
-    model_id: str = "default",
-    reasoning_effort: str = "default",
-) -> dict[str, float]:
-    """Extract 35 model-conditioned and structural features from problem text."""
-    if not isinstance(text, str):
-        text = str(text) if text is not None else ""
+    # 2. Derive narrative story spans (S) as the complement intervals
+    story_char_spans: list[tuple[int, int]] = []
+    curr = 0
+    for start, end in sorted(math_char_spans):
+        if start > curr:
+            story_char_spans.append((curr, start))
+        curr = max(curr, end)
+    if curr < n_chars:
+        story_char_spans.append((curr, n_chars))
 
-    char_count = float(len(text))
-    words = text.split()
-    word_count = float(len(words))
-    line_count = float(len(text.splitlines())) if text else 0.0
-    avg_word_length = char_count / max(1.0, word_count) if word_count > 0 else 0.0
+    # 3. Extract formal math content from math spans
+    math_texts = [raw[s:e] for s, e in math_char_spans]
+    math_blob = " ".join(math_texts)
 
-    math_matches = RE_MATH_BLOCKS.findall(text)
-    math_delimiter_count = float(len(math_matches))
-    math_chars = sum(len(m) for m in math_matches)
-    math_char_ratio = (float(math_chars) / max(1.0, char_count)) if char_count > 0 else 0.0
+    # Variables (filter out LaTeX command words)
+    raw_vars = VARIABLE_RE.findall(math_blob)
+    latex_escapes = set("abcdefghijklmnopqrstuvwxyz") - {"x", "y", "z", "n", "k", "m", "a", "b", "c", "p", "q", "r", "s", "t", "u", "v", "w"}
+    variables = sorted(list(set(v for v in raw_vars if len(v) == 1 and v.lower() not in {"e", "d", "i"} or v in {"x", "y", "z", "n", "k"})))
 
-    latex_commands = RE_LATEX_COMMAND.findall(text)
-    latex_command_count = float(len(latex_commands))
+    # Equations and relations
+    equations: list[str] = []
+    relations: list[str] = []
+    for mt in math_texts:
+        clean_mt = mt.strip("$").strip(r"\[\]\(\)")
+        if RELATION_RE.search(clean_mt):
+            equations.append(clean_mt)
+        rels = RELATION_RE.findall(clean_mt)
+        relations.extend(rels)
 
-    lower_text = text.lower()
-    fraction_count = float(lower_text.count(r"\frac") + lower_text.count(r"\dfrac"))
-    sqrt_count = float(lower_text.count(r"\sqrt"))
-    sum_prod_int_count = float(
-        lower_text.count(r"\sum") + lower_text.count(r"\prod") + lower_text.count(r"\int")
+    # Numbers
+    numbers = NUMBER_RE.findall(raw)
+
+    # Constraint density: ratio of math characters to total characters
+    total_math_chars = sum(e - s for s, e in math_char_spans)
+    constraint_density = float(total_math_chars / max(1, n_chars))
+
+    # Domain Classification
+    raw_lower = raw.lower()
+    is_geom = any(kw in raw_lower for kw in GEOMETRY_KEYWORDS)
+    is_nt = any(kw in raw_lower for kw in NUMBER_THEORY_KEYWORDS)
+    is_alg = bool(len(equations) > 0 and not is_geom)
+
+    # Invariants
+    has_cyclic = (
+        ("x" in variables and "y" in variables and "z" in variables)
+        or ("a" in variables and "b" in variables and "c" in variables)
+    ) and any("+" in eq and ("=" in eq or r"\le" in eq or r"\ge" in eq) for eq in equations)
+
+    is_diophantine = is_nt and ("integer" in raw_lower or "positive" in raw_lower) and len(equations) > 0
+
+    return FormalMathAST(
+        variables=variables,
+        equations=equations,
+        relations=sorted(list(set(relations))),
+        numbers=numbers,
+        math_char_spans=math_char_spans,
+        story_char_spans=story_char_spans,
+        constraint_density=constraint_density,
+        is_geometry=is_geom,
+        is_number_theory=is_nt,
+        is_algebra=is_alg,
+        has_cyclic_symmetry=has_cyclic,
+        is_diophantine=is_diophantine,
+        raw_problem=raw,
     )
-    binom_count = float(lower_text.count(r"\binom") + lower_text.count(r"\choose"))
-    subscript_count = float(text.count("_"))
-    superscript_count = float(text.count("^"))
 
-    equal_sign_count = float(text.count("="))
-    inequality_sign_count = float(
-        text.count("<")
-        + text.count(">")
-        + lower_text.count(r"\le")
-        + lower_text.count(r"\ge")
-        + lower_text.count(r"\neq")
-    )
-    relation_count = equal_sign_count + inequality_sign_count
 
-    math_combined = " ".join(math_matches) if math_matches else text
-    variables = set(RE_VARIABLES.findall(math_combined))
-    distinct_variable_count = float(len(variables))
-    degrees_of_freedom = distinct_variable_count - equal_sign_count
-    max_bracket_depth = compute_max_bracket_depth(text)
-    has_recurrence = 1.0 if RE_RECURRENCE.search(text) else 0.0
+def get_math_and_story_token_indices(
+    tokenizer: Any,
+    prompt: str,
+    math_char_spans: list[tuple[int, int]],
+) -> tuple[list[int], list[int]]:
+    """Map character intervals of formal math (G) and narrative (S) to token indices.
 
-    numbers = RE_NUMBERS.findall(text)
-    number_count = float(len(numbers))
-    float_values = []
-    has_float = 0.0
-    for n in numbers:
+    Guarantees non-empty index lists for both G and S.
+    """
+    if not prompt:
+        return [0], [0]
+
+    # Attempt FastTokenizer offset mapping
+    try:
+        enc = tokenizer(prompt, return_offsets_mapping=True, return_tensors="pt")
+        if "offset_mapping" in enc and enc["offset_mapping"] is not None:
+            offsets = enc["offset_mapping"][0].tolist()
+            math_indices: list[int] = []
+            story_indices: list[int] = []
+
+            for idx, (t_start, t_end) in enumerate(offsets):
+                if t_start == t_end:
+                    continue  # Special token
+                # Check overlap with any math span
+                is_math = any(max(t_start, m_s) < min(t_end, m_e) for m_s, m_e in math_char_spans)
+                if is_math:
+                    math_indices.append(idx)
+                else:
+                    story_indices.append(idx)
+
+            if math_indices and story_indices:
+                return math_indices, story_indices
+    except Exception:
+        pass
+
+    # Robust token-decoding fallback
+    try:
+        input_ids = tokenizer.encode(prompt, add_special_tokens=True)
+    except Exception:
+        return [0], [0]
+
+    n_tokens = len(input_ids)
+    if n_tokens <= 1:
+        return [0], [0]
+
+    math_indices = []
+    story_indices = []
+    curr_char = 0
+
+    for idx, tid in enumerate(input_ids):
         try:
-            val = float(n)
-            float_values.append(val)
-            if "." in n:
-                has_float = 1.0
-        except ValueError:
-            pass
+            tok_str = tokenizer.decode([tid])
+        except Exception:
+            tok_str = ""
 
-    max_number = max(float_values) if float_values else 0.0
-    max_number_magnitude = float(math.log10(1.0 + abs(max_number))) if max_number >= 0 else 0.0
-    has_integer_constraint = 1.0 if RE_INTEGER_CONSTRAINT.search(text) else 0.0
+        clean_tok = tok_str.strip()
+        if not clean_tok:
+            story_indices.append(idx)
+            continue
 
-    has_geometry = 1.0 if RE_GEOMETRY.search(text) else 0.0
-    has_number_theory = 1.0 if RE_NUMBER_THEORY.search(text) else 0.0
-    has_combinatorics = 1.0 if RE_COMBINATORICS.search(text) else 0.0
-    has_algebra = 1.0 if RE_ALGEBRA.search(text) else 0.0
+        pos = prompt.find(clean_tok, curr_char)
+        if pos == -1:
+            pos = curr_char
+        end_pos = pos + len(clean_tok)
+        curr_char = pos
 
-    has_find = 1.0 if RE_FIND_EVALUATE.search(text) else 0.0
-    has_prv = 1.0 if RE_PROVE.search(text) else 0.0
-    question_mark_count = float(text.count("?"))
+        is_math = any(max(pos, m_s) < min(end_pos, m_e) for m_s, m_e in math_char_spans)
+        if is_math:
+            math_indices.append(idx)
+        else:
+            story_indices.append(idx)
 
-    narrative_step_count = float(len(RE_NARRATIVE_STEPS.findall(text)))
-    is_word_problem = 1.0 if (math_char_ratio < 0.20 and char_count > 220.0) else 0.0
-    subscript_density = subscript_count / max(1.0, word_count)
+    # Fallback to prevent empty partition
+    if not math_indices and story_indices:
+        # Assign tokens containing math chars to math
+        new_story = []
+        for idx in story_indices:
+            try:
+                t_text = tokenizer.decode([input_ids[idx]])
+            except Exception:
+                t_text = ""
+            if any(c in t_text for c in "0123456789+-*/=^_{}\\$"):
+                math_indices.append(idx)
+            else:
+                new_story.append(idx)
+        story_indices = new_story
 
-    # Cognitive load and capacity ratios
-    cognitive_load = (char_count * math_char_ratio) / 100.0
-    model_param_log = parse_model_param_log(model_id)
-    reasoning_effort_scale = parse_reasoning_effort_scale(reasoning_effort)
-    capacity_to_load_ratio = (model_param_log + 1.0) / (cognitive_load + 1.0)
+    if not math_indices:
+        math_indices = [idx for idx in range(n_tokens // 2, n_tokens)]
+    if not story_indices:
+        story_indices = [idx for idx in range(0, max(1, n_tokens // 2))]
 
-    return {
-        "char_count": char_count,
-        "word_count": word_count,
-        "line_count": line_count,
-        "avg_word_length": avg_word_length,
-        "math_delimiter_count": math_delimiter_count,
-        "math_char_ratio": math_char_ratio,
-        "latex_command_count": latex_command_count,
-        "fraction_count": fraction_count,
-        "sqrt_count": sqrt_count,
-        "sum_prod_int_count": sum_prod_int_count,
-        "binom_count": binom_count,
-        "subscript_count": subscript_count,
-        "superscript_count": superscript_count,
-        "equal_sign_count": equal_sign_count,
-        "inequality_sign_count": inequality_sign_count,
-        "relation_count": relation_count,
-        "distinct_variable_count": distinct_variable_count,
-        "degrees_of_freedom": degrees_of_freedom,
-        "max_bracket_depth": max_bracket_depth,
-        "has_recurrence": has_recurrence,
-        "number_count": number_count,
-        "max_number_magnitude": max_number_magnitude,
-        "has_float": has_float,
-        "has_integer_constraint": has_integer_constraint,
-        "has_geometry_keyword": has_geometry,
-        "has_number_theory_keyword": has_number_theory,
-        "has_combinatorics_keyword": has_combinatorics,
-        "has_algebra_keyword": has_algebra,
-        "has_find_evaluate": has_find,
-        "has_prove": has_prv,
-        "question_mark_count": question_mark_count,
-        "narrative_step_count": narrative_step_count,
-        "is_word_problem": is_word_problem,
-        "subscript_density": subscript_density,
-        "cognitive_load": cognitive_load,
-        "model_param_log": model_param_log,
-        "reasoning_effort_scale": reasoning_effort_scale,
-        "capacity_to_load_ratio": capacity_to_load_ratio,
-    }
-
-
-def extract_symbolic_feature_vector(
-    text: str,
-    model_id: str = "default",
-    reasoning_effort: str = "default",
-) -> np.ndarray:
-    """Extract ordered numeric feature vector from problem text and model priors."""
-    feature_dict = extract_symbolic_features(text, model_id, reasoning_effort)
-    return np.array([feature_dict[name] for name in SYMBOLIC_FEATURE_NAMES], dtype=np.float64)
-
-
-def extract_feature_dataframe(
-    texts: Sequence[str],
-    model_id: str = "default",
-    reasoning_effort: str = "default",
-) -> pd.DataFrame:
-    """Extract structured DataFrame of symbolic features for a sequence of texts."""
-    rows = [extract_symbolic_features(t, model_id, reasoning_effort) for t in texts]
-    return pd.DataFrame(rows, columns=list(SYMBOLIC_FEATURE_NAMES))
+    return math_indices, story_indices
