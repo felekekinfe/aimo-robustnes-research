@@ -67,32 +67,22 @@ class ContrastiveWhiteBoxTests(unittest.TestCase):
             self.assertIs(type(res), bool)
 
     def test_mocked_stable_vs_unstable_contrastive(self) -> None:
-        """Verify that low drift + positive margin predicts True, high drift predicts False."""
+        """Verify that high causal grounding + strong spectral compression predicts True, poor predicts False."""
         problems = ["Compute $2+2$.", "In $\\triangle ABC$, compute the circumcircle radius."]
 
         stable_metric = ContrastiveMetrics(
-            cosine_sim=0.998,
-            latent_drift=0.002,
-            rel_l2_dist=0.005,
-            math_span_drift=0.003,
-            kl_div=0.015,
-            entropy_shift=0.05,
-            baseline_entropy=1.5,
-            margin_orig=0.30,
-            margin_variant=0.28,
-            margin_agreement=True,
+            causal_grounding_jsd=0.18,
+            spectral_compression=0.12,
+            late_erank=0.52,
+            math_surprisal=1.80,
+            causal_hidden_shift=0.08,
         )
         unstable_metric = ContrastiveMetrics(
-            cosine_sim=0.90,
-            latent_drift=0.025,
-            rel_l2_dist=0.060,
-            math_span_drift=0.020,
-            kl_div=0.12,
-            entropy_shift=0.30,
-            baseline_entropy=1.5,
-            margin_orig=0.30,
-            margin_variant=0.02,
-            margin_agreement=False,
+            causal_grounding_jsd=0.01,
+            spectral_compression=-0.02,
+            late_erank=0.82,
+            math_surprisal=3.60,
+            causal_hidden_shift=0.01,
         )
 
         with mock.patch(
@@ -106,30 +96,20 @@ class ContrastiveWhiteBoxTests(unittest.TestCase):
         self.assertFalse(results[1])
 
     def test_realistic_bfloat16_prefill_discrimination(self) -> None:
-        """Verify realistic bfloat16 scales (0.002 vs 0.015) produce balanced, discriminating outputs."""
+        """Verify realistic Mechanistic Interpretability signals produce balanced, discriminating outputs."""
         problems = ["Find all real roots of $x^2 + 5x + 6 = 0$.", "Let $N$ be a 3-digit number..."]
 
         res_stable = ContrastiveMetrics(
-            cosine_sim=0.998,
-            latent_drift=0.002,
-            math_span_drift=0.003,
-            kl_div=0.015,
-            entropy_shift=0.05,
-            baseline_entropy=1.5,
-            margin_orig=0.40,
-            margin_variant=0.38,
-            margin_agreement=True,
+            causal_grounding_jsd=0.16,
+            spectral_compression=0.10,
+            late_erank=0.55,
+            math_surprisal=1.90,
         )
         res_unstable = ContrastiveMetrics(
-            cosine_sim=0.985,
-            latent_drift=0.015,
-            math_span_drift=0.018,
-            kl_div=0.085,
-            entropy_shift=0.22,
-            baseline_entropy=1.5,
-            margin_orig=0.35,
-            margin_variant=0.05,
-            margin_agreement=False,
+            causal_grounding_jsd=0.02,
+            spectral_compression=-0.01,
+            late_erank=0.80,
+            math_surprisal=3.50,
         )
 
         with mock.patch(
@@ -141,6 +121,47 @@ class ContrastiveWhiteBoxTests(unittest.TestCase):
         self.assertEqual(len(predictions), 2)
         self.assertIn(True, predictions)
         self.assertIn(False, predictions)
+
+    def test_spectral_effective_rank_computation(self) -> None:
+        """Verify compute_spectral_effective_rank returns values in [0.0, 1.0]."""
+        import torch
+        from contrastive.contrastive_detector import compute_spectral_effective_rank
+
+        # Highly correlated tokens (rank 1) -> erank near 0
+        u = torch.randn(64)
+        H_rank1 = torch.outer(torch.linspace(1, 10, 10), u)
+        erank_low = compute_spectral_effective_rank(H_rank1)
+        self.assertGreaterEqual(erank_low, 0.0)
+        self.assertLess(erank_low, 0.10)
+
+        # Random orthogonal-like tokens -> erank higher
+        torch.manual_seed(42)
+        H_rand = torch.randn(10, 64)
+        erank_high = compute_spectral_effective_rank(H_rand)
+        self.assertGreater(erank_high, erank_low)
+        self.assertLessEqual(erank_high, 1.0)
+
+    def test_constraint_ablation(self) -> None:
+        """Verify build_constraint_ablated_problem ablates internal conditions."""
+        from contrastive.contrastive_detector import build_constraint_ablated_problem
+
+        problem = "Let $x$ and $y$ be positive integers such that $x + y = 10$. Find $x^2 - y^2$."
+        ablated = build_constraint_ablated_problem(problem)
+        self.assertNotEqual(problem, ablated)
+        self.assertIn("$c$", ablated)
+
+    def test_n_equals_one_invariance(self) -> None:
+        """Verify strict N=1 invariance: predictions do not depend on other batch items."""
+        p1 = "Find all positive integers $n$ such that $n^2 + 1$ is prime."
+        p2 = "In triangle $ABC$, let $AB = 5, BC = 6, CA = 7$. Compute the area."
+
+        with mock.patch("contrastive.decision.extract_contrastive_batch", return_value=None):
+            r_both = SOLUTION.are_robust("test-model", "default", [p1, p2])
+            r_1 = SOLUTION.are_robust("test-model", "default", [p1])
+            r_2 = SOLUTION.are_robust("test-model", "default", [p2])
+
+        self.assertEqual(r_both[0], r_1[0])
+        self.assertEqual(r_both[1], r_2[0])
 
     def test_fallback_when_neural_unavailable(self) -> None:
         """Verify graceful fallback when neural model fails or returns None."""

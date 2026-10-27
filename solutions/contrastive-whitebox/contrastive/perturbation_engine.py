@@ -295,6 +295,56 @@ def generate_variants(problem: str, n: int = 3) -> List[str]:
     return pool[:n]
 
 
+def build_perturbation_triplet(problem: str) -> tuple[str, str, str]:
+    """Build organizer-safe perturbation triplet (v_ctrl, v_1, v_2).
+
+    1. v_ctrl: Harmless framing change to measure baseline hidden-state shift.
+    2. v_1: Algebraic / structural reframe with phrasing and variable swap (guaranteed non-identical).
+    3. v_2: Directive / constraint order reframe (guaranteed distinct from problem and v_1).
+    """
+    if not problem or not isinstance(problem, str):
+        problem = "Find the value."
+
+    p_clean = problem.strip()
+
+    # 1. v_ctrl: Meaning-Preserving Control Wrapper
+    v_ctrl = "Consider the following mathematics problem:\n" + p_clean
+
+    # 2. v_1: Phrasing substitutions + variable swap + syntactic
+    v_1 = p_clean
+    phrasing_subs = [
+        (re.compile(r"\bFind the value of\b", re.IGNORECASE), "Determine the value of"),
+        (re.compile(r"\bFind the number of\b", re.IGNORECASE), "Determine the number of"),
+        (re.compile(r"\bFind all\b", re.IGNORECASE), "Determine all"),
+        (re.compile(r"\bFind\b"), "Determine"),
+        (re.compile(r"\bLet\b"), "Suppose"),
+        (re.compile(r"\bCompute\b"), "Evaluate"),
+        (re.compile(r"\bCalculate\b"), "Find"),
+        (re.compile(r"\bpositive integers\b"), "integers greater than zero"),
+        (re.compile(r"\bpositive integer\b"), "integer greater than zero"),
+        (re.compile(r"\breal numbers\b"), "real values"),
+        (re.compile(r"\breal number\b"), "real value"),
+    ]
+    for pat, rep in phrasing_subs:
+        if pat.search(v_1):
+            v_1 = pat.sub(rep, v_1, count=1)
+            break
+
+    v_1 = safe_variable_swap(v_1, seed_offset=0)
+    v_1 = perturb_syntactic(v_1)
+
+    # 100% Non-identical guarantee for v_1
+    if v_1.strip() == p_clean:
+        v_1 = "Problem Statement: " + p_clean + "\n(Express your final answer clearly.)"
+
+    # 3. v_2: Distinct Directive / Constraint Order Reframe
+    v_2 = "Given the conditions below, solve the problem:\n" + p_clean + "\nWhat is the required value?"
+    if v_2.strip() == v_1.strip() or v_2.strip() == p_clean:
+        v_2 = "Consider the mathematical conditions:\n" + p_clean + "\nDetermine the solution."
+
+    return v_ctrl, v_1, v_2
+
+
 def generate_contrastive_variant(problem_text: str) -> str:
     """Primary contrastive variant preserving backward compatibility."""
     if not problem_text or not isinstance(problem_text, str):

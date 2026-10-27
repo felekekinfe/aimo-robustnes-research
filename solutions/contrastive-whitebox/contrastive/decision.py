@@ -21,9 +21,7 @@ import numpy as np
 from contrastive.contrastive_detector import (
     ContrastiveMetrics,
     extract_contrastive_batch,
-    extract_prefill_metrics,
     get_or_load_model,
-    run_micro_rollout_verification,
 )
 from contrastive.perturbation_engine import generate_contrastive_variant, generate_variants
 
@@ -205,36 +203,42 @@ def finalize_decision(
 
 
 def get_model_tier_base_rate(model_id: str, effort: str) -> float:
-    """Empirical robustness base rate per (model_tier, reasoning_effort)."""
+    """Empirical robustness base rate per (model_tier, reasoning_effort).
+
+    Tightly centered inside [0.42, 0.58] so logit_base is strictly in [-0.35, +0.35].
+    """
     m = (model_id or "").lower()
     e = (effort or "default").lower()
 
-    # Frontier closed models (GPT-5.2, GLM-5.1)
-    if "gpt-5.2" in m or "glm-5.1" in m:
-        return 0.85
-    if "gemini" in m:
-        return 0.40 if e == "low" else 0.55
+    is_large = any(
+        t in m
+        for t in [
+            "120b", "397b", "70b", "72b", "gpt-oss", "gpt-5", "glm-5", "gemini", "frontier", "claude"
+        ]
+    )
 
-    # Massive models (120B, 397B, 70B, etc.)
-    if any(t in m for t in ["120b", "397b", "70b", "72b", "gpt-oss"]):
+    if is_large:
         if e == "low":
-            return 0.45
+            return 0.47
         elif e == "high":
-            return 0.75
+            return 0.58
         else:
-            return 0.60
-
-    # Small/medium open models (4B, 7B, 8B)
-    if e == "low":
-        return 0.40
-    elif e == "high":
-        return 0.65
+            return 0.53
     else:
-        return 0.55
+        # Small models (<= 14B)
+        if e == "low":
+            return 0.43
+        elif e == "high":
+            return 0.55
+        else:
+            return 0.49
 
 
 def get_problem_complexity_delta(problem: str, feat_dict: dict | None = None) -> float:
-    """Structural math complexity delta in log-odds space."""
+    """Structural math complexity delta in log-odds space, zero-centered around median.
+
+    Outputs in [-0.80, +0.80].
+    """
     f = feat_dict or _problem_features(problem or "")
     fragile_triggers = (
         f["has_incenter"]
@@ -249,50 +253,27 @@ def get_problem_complexity_delta(problem: str, feat_dict: dict | None = None) ->
         or (f["has_bisector"] and f["has_triangle"])
         or f["has_acute_triangle"]
     )
+    delta = 0.0
     if fragile_triggers:
-        return -0.70
-    if f["len"] > 450:
-        return -0.30
-    if f["len"] < 200 and not f["has_triangle"]:
-        return +0.30
-    return 0.0
+        delta -= 0.45
+    if f["len"] > 400:
+        delta -= 0.20
+    if f["len"] < 180 and not f["has_triangle"] and not f["has_divisor_remainder"]:
+        delta += 0.35
+    return max(-0.80, min(0.80, delta))
 
 
 def compute_neural_delta(metric: ContrastiveMetrics) -> float:
-    """Bidirectional, zero-centered white-box stability delta in log-odds space."""
-    # 1. Excess Cosine Drift (centered at 0.0015)
-    ld = metric.latent_drift
-    delta_cos = -1.2 * (ld - 0.0015) / 0.0020
+    """Spectral Effective Rank & Causal Math-Constraint Sensitivity competence score."""
+    # 1. High causal grounding (model strongly reacts when math constraints are masked) -> +Robust
+    z_ground = math.tanh((metric.causal_grounding_jsd - 0.08) / 0.06)
+    # 2. Strong spectral compression from 0.50L to 1.00L & focused late-layer rank -> +Robust
+    z_spec = math.tanh((metric.spectral_compression - 0.03) / 0.04) - 0.5 * math.tanh((metric.late_erank - 0.68) / 0.10)
+    # 3. Low math-token surprisal (familiar mathematical syntax/structure) -> +Robust
+    z_surp = -math.tanh((metric.math_surprisal - 2.40) / 0.75)
 
-    # 2. Logit KL Divergence (centered at 0.030)
-    kl = metric.kl_div
-    delta_kl = -0.8 * (kl - 0.030) / 0.040
-
-    # 3. Late Layer Agreement (centered at 0.72)
-    agree = getattr(metric, "late_layer_agreement", 0.72)
-    delta_agree = +0.6 * (agree - 0.72) / 0.10
-
-    # 4. Logit Lens Divergence at 0.75L
-    ll = getattr(metric, "logit_lens_divergence", 0.0)
-    delta_ll = -0.5 * min(2.0, max(0.0, ll - 0.020) / 0.030)
-
-    # 5. Micro-rollout verification adjustments if available
-    delta_rollout = 0.0
-    if metric.used_micro_rollout:
-        r_conv = metric.rollout_convergence_ratio or 1.0
-        r_margin = metric.rollout_min_margin or 0.0
-        if r_conv < 0.85 and r_margin > 0.22:
-            delta_rollout = +0.60
-        elif r_conv > 1.15 or r_margin < 0.12:
-            delta_rollout = -0.80
-
-    total_delta = delta_cos + delta_kl + delta_agree + delta_ll + delta_rollout
-
-    # Hard veto for extreme divergence
-    if ld > 0.035 or kl > 0.35:
-        total_delta = -5.0
-
-    return max(-4.0, min(3.0, total_delta))
+    s_wb = 0.45 * z_ground + 0.35 * z_spec + 0.20 * z_surp  # Strictly bounded in [-1.15, +1.15]
+    return float(s_wb)
 
 
 def _evaluate_symbolic_probability(
@@ -304,9 +285,9 @@ def _evaluate_symbolic_probability(
     """Calibrated probability based on empirical base rates and problem complexity."""
     m, e = split_model_and_effort(model_id, reasoning_effort)
     base_rate = get_model_tier_base_rate(m, e)
-    p_clamped = max(0.05, min(0.95, base_rate))
+    p_clamped = max(0.42, min(0.58, base_rate))
     logit = math.log(p_clamped / (1.0 - p_clamped))
-    logit += get_problem_complexity_delta(problem, feat_dict)
+    logit += 1.10 * get_problem_complexity_delta(problem, feat_dict)
     return 1.0 / (1.0 + math.exp(-logit))
 
 
@@ -347,7 +328,7 @@ def predict_contrastive_robustness(
 
     base_model_id, effort = split_model_and_effort(model_id, reasoning_effort)
 
-    # --- Stage 1: Try White-Box Contrastive Extraction ---
+    # --- Stage 1: Try White-Box Spectral & Causal Extraction ---
     contrastive_metrics = None
     try:
         contrastive_metrics = extract_contrastive_batch(
@@ -364,20 +345,52 @@ def predict_contrastive_robustness(
     )
 
     decisions: list[bool] = []
+    diagnostics: list[dict[str, float]] = []
+
     for prob, metric in zip(problems, metrics_list):
         feat_dict = _problem_features(prob)
         base_rate = get_model_tier_base_rate(model_id, effort)
-        p_clamped = max(0.05, min(0.95, base_rate))
-        logit = math.log(p_clamped / (1.0 - p_clamped))
+        p_clamped = max(0.42, min(0.58, base_rate))
+        logit_base = math.log(p_clamped / (1.0 - p_clamped))
 
-        # Problem structural complexity delta
-        logit += get_problem_complexity_delta(prob, feat_dict)
+        sym_delta = get_problem_complexity_delta(prob, feat_dict)
 
-        # White-Box neural delta if neural metrics were successfully extracted
         if metric is not None:
-            logit += compute_neural_delta(metric)
+            s_wb = compute_neural_delta(metric)
+            total_logit = logit_base + 0.55 * sym_delta + 0.90 * s_wb
+        else:
+            s_wb = 0.0
+            total_logit = logit_base + 1.10 * sym_delta
 
-        p_final = 1.0 / (1.0 + math.exp(-logit))
-        decisions.append(bool(p_final >= 0.50))
+        is_robust = bool(total_logit >= 0.0)
+        decisions.append(is_robust)
+
+        diagnostics.append({
+            "ground_jsd": float(getattr(metric, "causal_grounding_jsd", 0.08)) if metric else 0.08,
+            "spec_comp": float(getattr(metric, "spectral_compression", 0.0)) if metric else 0.0,
+            "late_erank": float(getattr(metric, "late_erank", 0.60)) if metric else 0.60,
+            "surp": float(getattr(metric, "math_surprisal", 2.40)) if metric else 2.40,
+            "sym": float(sym_delta),
+            "s_wb": float(s_wb),
+            "logit": float(total_logit),
+        })
+
+    # Diagnostic Telemetry Logging
+    n_total = len(problems)
+    n_true = sum(decisions)
+    d0_str = (
+        f"jsd={diagnostics[0]['ground_jsd']:.3f} comp={diagnostics[0]['spec_comp']:.3f} erank={diagnostics[0]['late_erank']:.3f} s_wb={diagnostics[0]['s_wb']:.2f} logit={diagnostics[0]['logit']:.2f}"
+        if diagnostics
+        else "N/A"
+    )
+    d1_str = (
+        f"jsd={diagnostics[1]['ground_jsd']:.3f} comp={diagnostics[1]['spec_comp']:.3f} erank={diagnostics[1]['late_erank']:.3f} s_wb={diagnostics[1]['s_wb']:.2f} logit={diagnostics[1]['logit']:.2f}"
+        if len(diagnostics) > 1
+        else "N/A"
+    )
+    print(
+        f"[spectral_causal] model={model_id} effort={effort} n={n_total} "
+        f"robust={n_true}/{n_total} ({n_true/n_total:.1%}) | p0: {d0_str} | p1: {d1_str}"
+    )
 
     return decisions
