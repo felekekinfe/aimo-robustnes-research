@@ -311,12 +311,12 @@ def compute_causal_score(metric: CausalConsistencyMetrics) -> float:
     # 1. Check if neural latent intervention produced non-default metrics
     if manifold_stab != 0.90 or causal_ground != 0.60:
         z_ground = math.tanh((causal_ground - 0.55) / 0.12)
-        z_manifold = math.tanh((manifold_stab - 0.94) / 0.05)
+        z_manifold = math.tanh((manifold_stab - 0.88) / 0.08)
         return float(0.60 * z_ground + 0.40 * z_manifold)
 
     # 2. Check if consistency & sensitivity were explicitly customized
     if consistency != 0.85 or sensitivity != 0.20:
-        z_cons = math.tanh((consistency - 0.88) / 0.08)
+        z_cons = math.tanh((consistency - 0.82) / 0.08)
         z_sens = math.tanh((sensitivity - 0.20) / 0.10)
         return float(z_cons - 0.5 * z_sens)
 
@@ -423,16 +423,16 @@ def predict_contrastive_robustness(
 
             # Feature extraction (Step 2: verified features n_conditions and length)
             n_cond = len(RELATION_RE.findall(prob or ""))
-            n_cond_norm = (n_cond - 1.96) / 1.57
+            n_cond_norm = (n_cond - 2.0) / 2.0
             plen = len(prob or "")
-            len_norm = (plen - 250.0) / 150.0
+            len_norm = (plen - 325.0) / 200.0
 
             if metric is not None and (time.time() - t_start) < PER_PROBLEM_TIMEOUT:
                 s_causal = compute_causal_score(metric)
-                total_logit = lo_prior - 0.35 * n_cond_norm - 0.20 * len_norm + 1.20 * s_causal
+                total_logit = lo_prior - 0.40 * n_cond_norm - 0.35 * len_norm + 0.05 + 1.20 * s_causal
             else:
                 s_causal = 0.0
-                total_logit = lo_prior - 0.35 * n_cond_norm - 0.20 * len_norm
+                total_logit = lo_prior - 0.40 * n_cond_norm - 0.35 * len_norm + 0.05
 
             is_robust = bool(total_logit >= 0.0)
         except Exception:

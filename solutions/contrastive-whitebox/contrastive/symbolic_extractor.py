@@ -235,3 +235,21 @@ def get_math_and_story_token_indices(
         story_indices = [idx for idx in range(0, max(1, n_tokens // 2))]
 
     return math_indices, story_indices
+
+
+def extract_symbolic_features(problem: str) -> dict[str, Any]:
+    """Extract lightweight dictionary of symbolic and structural features."""
+    ast = extract_formal_ast(problem)
+    return {
+        "math_char_ratio": ast.constraint_density,
+        "n_variables": len(ast.variables),
+        "n_equations": len(ast.equations),
+        "n_relations": len(ast.relations),
+        "n_numbers": len(ast.numbers),
+        "is_geometry": ast.is_geometry,
+        "is_number_theory": ast.is_number_theory,
+        "is_algebra": ast.is_algebra,
+        "has_cyclic_symmetry": ast.has_cyclic_symmetry,
+        "is_diophantine": ast.is_diophantine,
+    }
+
