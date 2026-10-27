@@ -3,4 +3,5 @@ __pycache__/
 data/
 dist/
 .idea/
+.vscode/
 solutions/*.zip

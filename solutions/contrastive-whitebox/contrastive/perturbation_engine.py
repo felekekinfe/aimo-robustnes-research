@@ -295,6 +295,73 @@ def generate_variants(problem: str, n: int = 3) -> List[str]:
     return pool[:n]
 
 
+def generate_evolutionary_variants(problem: str) -> tuple[str, str, str]:
+    """Generate systematic evolutionary variants using causal graph nodes.
+
+    Returns:
+        (v_orig, v_narrative_swap, v_constraint_stress)
+        - v_orig: The original untouched problem text.
+        - v_narrative_swap: Replaces surface narrative intro (S) with formal academic framing,
+          leaving numbers (N) and math spans (G) strictly untouched.
+        - v_constraint_stress: Mutates a numerical value or constraint within N/G to test sensitivity.
+    """
+    if not problem or not isinstance(problem, str):
+        p_clean = "Find the value."
+    else:
+        p_clean = problem.strip()
+
+    v_orig = p_clean
+
+    from contrastive.causal_graph import extract_causal_nodes
+    nodes = extract_causal_nodes(p_clean)
+
+    # 1. v_narrative_swap: Formal academic framing replacing narrative intro
+    surface = nodes.get("surface_text", "")
+    sentences = nodes.get("sentences", [])
+
+    if surface and len(sentences) >= 2 and surface != nodes.get("question", ""):
+        remaining = [s for s in sentences if s != surface]
+        v_narrative_swap = "Let the mathematical conditions and variables be formally specified as follows: " + " ".join(remaining)
+    else:
+        v_narrative_swap = "Consider the following formal mathematical problem:\n" + p_clean
+
+    if not is_balanced(v_narrative_swap) or v_narrative_swap == v_orig:
+        v_narrative_swap = "Problem Statement: " + p_clean
+
+    # 2. v_constraint_stress: Mutate a numerical value or relational operator in N/G
+    v_constraint_stress = ""
+    numbers = nodes.get("numbers", [])
+    if numbers:
+        for num_str in numbers:
+            try:
+                val = int(num_str)
+                if val >= 2:
+                    new_val_str = str(val + 1)
+                    v_constraint_stress = re.sub(rf"\b{num_str}\b", new_val_str, p_clean, count=1)
+                    break
+            except ValueError:
+                continue
+
+    if not v_constraint_stress or v_constraint_stress == v_orig or not is_balanced(v_constraint_stress):
+        if r"\le" in p_clean:
+            v_constraint_stress = p_clean.replace(r"\le", "<", 1)
+        elif r"\ge" in p_clean:
+            v_constraint_stress = p_clean.replace(r"\ge", ">", 1)
+        elif r"\leq" in p_clean:
+            v_constraint_stress = p_clean.replace(r"\leq", "<", 1)
+        elif r"\geq" in p_clean:
+            v_constraint_stress = p_clean.replace(r"\geq", ">", 1)
+        elif "=" in p_clean:
+            v_constraint_stress = p_clean.replace("=", r"\ge", 1)
+        else:
+            v_constraint_stress = "Under the perturbed condition where the main bound is modified: " + p_clean
+
+    if not is_balanced(v_constraint_stress) or v_constraint_stress == v_orig:
+        v_constraint_stress = "Given the stressed constraint conditions: " + p_clean
+
+    return v_orig, v_narrative_swap, v_constraint_stress
+
+
 def build_perturbation_triplet(problem: str) -> tuple[str, str, str]:
     """Build organizer-safe perturbation triplet (v_ctrl, v_1, v_2).
 

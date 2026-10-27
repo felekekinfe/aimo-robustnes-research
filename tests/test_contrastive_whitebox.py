@@ -236,5 +236,58 @@ class ContrastiveWhiteBoxTests(unittest.TestCase):
         self.assertFalse(_is_oversized_model("Skywork/Skywork-OR1-Math-7B"))
 
 
+    def test_extract_causal_nodes(self) -> None:
+        """Verify extraction of surface_text, numbers, math_spans, and question."""
+        from contrastive.causal_graph import extract_causal_nodes
+
+        problem = "A farmer has 12 sheep and 8 cows. If each sheep drinks $3$ liters of water, find the total water."
+        nodes = extract_causal_nodes(problem)
+
+        self.assertIn("surface_text", nodes)
+        self.assertIn("numbers", nodes)
+        self.assertIn("math_spans", nodes)
+        self.assertIn("question", nodes)
+        self.assertIn("12", nodes["numbers"])
+        self.assertIn("8", nodes["numbers"])
+        self.assertTrue(len(nodes["math_spans"]) > 0)
+        self.assertIn("total water", nodes["question"].lower())
+
+    def test_generate_evolutionary_variants(self) -> None:
+        """Verify that generate_evolutionary_variants returns 3 distinct, balanced strings."""
+        from contrastive.perturbation_engine import generate_evolutionary_variants
+
+        problem = "In a right triangle $ABC$ with legs $a = 6$ and $b = 8$, compute the hypotenuse $c$."
+        v_orig, v_narr, v_stress = generate_evolutionary_variants(problem)
+
+        self.assertEqual(v_orig, problem)
+        self.assertNotEqual(v_orig, v_narr)
+        self.assertNotEqual(v_orig, v_stress)
+        self.assertNotEqual(v_narr, v_stress)
+        # All variants should preserve LaTeX delimiter balance
+        for variant in (v_orig, v_narr, v_stress):
+            self.assertEqual(variant.count("$") % 2, 0, f"Unbalanced $ in {variant}")
+
+    def test_causal_score_discrimination(self) -> None:
+        """Verify high consistency + low sensitivity -> positive score, low consistency -> negative score."""
+        from contrastive.contrastive_detector import CausalConsistencyMetrics
+        from contrastive.decision import compute_causal_score
+
+        robust_metric = CausalConsistencyMetrics(
+            consistency=0.92,
+            sensitivity=0.12,
+        )
+        fragile_metric = CausalConsistencyMetrics(
+            consistency=0.70,
+            sensitivity=0.45,
+        )
+
+        score_robust = compute_causal_score(robust_metric)
+        score_fragile = compute_causal_score(fragile_metric)
+
+        self.assertGreater(score_robust, 0.0)
+        self.assertLess(score_fragile, 0.0)
+        self.assertGreater(score_robust, score_fragile)
+
+
 if __name__ == "__main__":
     unittest.main()
