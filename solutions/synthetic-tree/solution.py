@@ -76,13 +76,19 @@ def evaluate_single_problem(
     model_id: str,
     extractor: BatchedTreeExtractor,
     prior_log_odds: float,
+    reasoning_effort: str = "default",
 ) -> bool:
     """Score an individual problem independently via the Synthetic Tree Blueprint."""
     t_start = time.time()
     try:
         raw_metrics = extractor.extract_tree_metrics(problem)
         stratified = evaluate_stratified_metrics(raw_metrics)
-        logit = compute_tree_decision_logit(model_id, raw_metrics, stratified)
+        logit = compute_tree_decision_logit(
+            model_id=model_id,
+            raw_metrics=raw_metrics,
+            stratified_metrics=stratified,
+            reasoning_effort=reasoning_effort,
+        )
 
         # Timeout guard
         if (time.time() - t_start) > PER_PROBLEM_TIMEOUT:
@@ -115,12 +121,13 @@ def are_robust(
     if not problems:
         return []
 
-    prior_log_odds = get_empirical_prior(model_id)
+    effort = str(reasoning_effort or "default")
+    prior_log_odds = get_empirical_prior(model_id, effort)
     extractor = _get_or_load_extractor(model_id)
 
     results: List[bool] = []
     for p in problems:
-        pred = evaluate_single_problem(p, model_id, extractor, prior_log_odds)
+        pred = evaluate_single_problem(p, model_id, extractor, prior_log_odds, effort)
         results.append(bool(pred))
 
     return results

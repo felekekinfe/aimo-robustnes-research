@@ -2,6 +2,7 @@
 
 Pillar 4 of Final Architecture Blueprint:
 - Fuses Empirical-Bayes Model Priors, Structural Problem Invariants,
+  Cognitive Load Modulation for Long & Hard Problems,
   Synthetic Tree Invariance & Causal Sensitivity, and Early CoT Dynamics.
 - Pure Python analytical scoring (zero .pkl / .joblib dependencies).
 """
@@ -13,12 +14,15 @@ from typing import Dict, Optional
 
 # Empirical Log-Odds Priors for Competition Models
 EMPIRICAL_MODEL_PRIORS: Dict[str, float] = {
-    # 5 Official Competition Models
-    "qwen/qwen3.5-4b": -0.315,
-    "deepseek-ai/deepseek-r1-0528-qwen3-8b": -0.169,
-    "skywork/skywork-or1-math-7b": 0.060,
-    "openai/gpt-oss-120b": 0.099,
-    "allenai/olmo-3-7b-think": 0.197,
+    # 5 Official Competition Models (with effort stratification)
+    "openai/gpt-oss-120b:high": 0.950,
+    "openai/gpt-oss-120b:medium": 0.100,
+    "openai/gpt-oss-120b:low": 0.510,
+    "openai/gpt-oss-120b": 0.100,
+    "skywork/skywork-or1-math-7b": 0.410,
+    "allenai/olmo-3-7b-think": 0.850,
+    "deepseek-ai/deepseek-r1-0528-qwen3-8b": 0.850,
+    "qwen/qwen3.5-4b": 0.290,
     # Validation Sample Exact Keys
     "gpt-oss-120b": -1.500,
     "gpt-oss-120b:low": -1.500,
@@ -37,60 +41,144 @@ EMPIRICAL_MODEL_PRIORS: Dict[str, float] = {
 }
 
 
-def get_empirical_prior(model_id: str) -> float:
-    """Retrieve empirical log-odds prior for model."""
+def get_empirical_prior(model_id: str, reasoning_effort: str = "default") -> float:
+    """Retrieve empirical log-odds prior for model and effort."""
     m_raw = (model_id or "").strip().lower()
+    e_clean = (reasoning_effort or "default").strip().lower()
+
+    # Split suffix if present in model_id (e.g. "gpt-oss-120b:low")
+    if ":" in m_raw:
+        parts = m_raw.rsplit(":", 1)
+        m_base = parts[0].strip()
+        if parts[1].strip() in {"low", "medium", "high", "default"}:
+            e_clean = parts[1].strip()
+    else:
+        m_base = m_raw
+
+    # Direct match with effort suffix
+    key_with_effort = f"{m_base}:{e_clean}"
+    if key_with_effort in EMPIRICAL_MODEL_PRIORS:
+        return EMPIRICAL_MODEL_PRIORS[key_with_effort]
+
     if m_raw in EMPIRICAL_MODEL_PRIORS:
         return EMPIRICAL_MODEL_PRIORS[m_raw]
-    m_base = m_raw.split(":")[0].strip()
     if m_base in EMPIRICAL_MODEL_PRIORS:
-        return EMPIRICAL_MODEL_PRIORS[m_base]
-    for pattern, log_odds in EMPIRICAL_MODEL_PRIORS.items():
-        if pattern in m_raw or m_base in pattern:
-            return log_odds
-    return 0.0
+        base_prior = EMPIRICAL_MODEL_PRIORS[m_base]
+    else:
+        base_prior = 0.0
+        for pattern, log_odds in EMPIRICAL_MODEL_PRIORS.items():
+            if pattern in m_raw or m_base in pattern:
+                base_prior = log_odds
+                break
+
+    # Effort modulation: high effort gives higher reasoning depth
+    if e_clean == "high":
+        base_prior += 0.40
+    elif e_clean == "low" and base_prior > 0.0:
+        base_prior -= 0.15
+
+    return base_prior
 
 
 def compute_tree_decision_logit(
     model_id: str,
     raw_metrics: Dict[str, float],
     stratified_metrics: Dict[str, float],
+    reasoning_effort: str = "default",
 ) -> float:
     """Compute combined linear meta-classifier logit for robustness decision."""
-    lo_prior = get_empirical_prior(model_id)
+    lo_prior = get_empirical_prior(model_id, reasoning_effort)
 
-    # 1. Structural features
+    # 1. Synthetic Tree Invariance & Causal Sensitivity
+    is_neural = raw_metrics.get("is_neural", 0.0) > 0.5
+    if is_neural:
+        inv_pass_rate = stratified_metrics.get("inv_pass_rate", 0.75)
+        max_inv_drift = stratified_metrics.get("max_inv_drift", 0.12)
+        causal_sens = stratified_metrics.get("causal_sensitivity", 0.15)
+
+        z_pass = math.tanh((inv_pass_rate - 0.75) / 0.15)
+        z_drift = math.tanh((0.12 - max_inv_drift) / 0.05)
+        z_sens = math.tanh((causal_sens - 0.15) / 0.05)
+        z_tree = 0.50 * z_pass + 0.30 * z_drift + 0.20 * z_sens
+
+        mean_margin = raw_metrics.get("cot_mean_margin", 0.45)
+        mean_entropy = raw_metrics.get("cot_mean_entropy", 1.50)
+        entropy_vol = raw_metrics.get("cot_entropy_volatility", 0.23)
+
+        z_margin = math.tanh((mean_margin - 0.45) / 0.15)
+        z_entropy = math.tanh((1.50 - mean_entropy) / 0.40)
+        z_volatility = math.tanh((0.25 - entropy_vol) / 0.10)
+        z_cot = 0.50 * z_margin + 0.30 * z_entropy + 0.20 * z_volatility
+    else:
+        z_tree = 0.0
+        z_cot = 0.0
+
+    # 2. Structural Features with Cognitive Load Modulation for Long & Hard Problems
     n_cond = raw_metrics.get("n_conditions", 2.0)
-    cond_norm = (n_cond - 2.0) / 2.0
+    plen = raw_metrics.get("char_length", math.exp(raw_metrics.get("log_length", 5.5)))
 
-    plen = math.exp(raw_metrics.get("log_length", 5.5))
-    len_norm = (plen - 325.0) / 200.0
+    # One-sided soft-saturating penalties: long/complex problems penalize,
+    # but short problems do NOT grant artificial bonuses to tricky traps
+    len_scaled = math.tanh(max(0.0, plen - 325.0) / 250.0)
+    cond_scaled = math.tanh(max(0.0, n_cond - 2.5) / 2.5)
 
-    # 2. Synthetic Tree Invariance & Causal Sensitivity
-    inv_pass_rate = stratified_metrics.get("inv_pass_rate", 0.75)
-    max_inv_drift = stratified_metrics.get("max_inv_drift", 0.12)
-    causal_sens = stratified_metrics.get("causal_sensitivity", 0.15)
+    # Ambiguity factor: dense formal math significantly reduces ambiguity
+    math_density = raw_metrics.get("math_density", 0.35)
+    ambiguity = max(0.25, min(1.0, 1.25 - math_density))
 
-    z_pass = math.tanh((inv_pass_rate - 0.75) / 0.15)
-    z_drift = math.tanh((0.12 - max_inv_drift) / 0.05)
-    z_sens = math.tanh((causal_sens - 0.15) / 0.05)
+    # Model Capacity & Effort Dampening:
+    # Frontier models (e.g. 120B, high effort) handle long contexts with low degradation
+    m_clean = (model_id or "").lower()
+    e_clean = (reasoning_effort or "").lower()
+    is_frontier = ("high" in e_clean or "120b" in m_clean or "nvfp4" in m_clean or "gpt-5" in m_clean)
+    is_small = any(tag in m_clean for tag in ("4b", "7b", "8b"))
 
-    z_tree = 0.50 * z_pass + 0.30 * z_drift + 0.20 * z_sens
+    if is_frontier:
+        capacity_damping = 0.45
+    elif "4b" in m_clean:
+        capacity_damping = 1.25
+    else:
+        capacity_damping = 0.85
 
-    # 3. Early CoT Dynamics
-    mean_margin = raw_metrics.get("cot_mean_margin", 0.45)
-    mean_entropy = raw_metrics.get("cot_mean_entropy", 1.50)
-    z_margin = math.tanh((mean_margin - 0.45) / 0.15)
-    z_entropy = math.tanh((1.50 - mean_entropy) / 0.40)
-    z_cot = 0.60 * z_margin + 0.40 * z_entropy
+    # Resilience discount: proven synthetic tree invariance discounts sequence length penalty
+    tree_resilience = max(0.25, 1.0 - 0.50 * max(0.0, z_tree))
+
+    eff_len_penalty = 0.45 * len_scaled * ambiguity * capacity_damping * tree_resilience
+    eff_cond_penalty = 0.35 * cond_scaled * capacity_damping * tree_resilience
+
+    # Formal math bonus for frontier models (clean algebraic specifications)
+    formal_bonus = 0.20 if (math_density >= 0.50 and is_frontier) else 0.0
+
+    # 3. Domain Fragility Vulnerability Offsets
+    vuln_offset = 0.0
+    if raw_metrics.get("has_divisor_remainder", 0.0) > 0.5:
+        vuln_offset -= 0.85
+    if raw_metrics.get("has_infinite_sum", 0.0) > 0.5:
+        vuln_offset -= 0.65
+    if raw_metrics.get("has_circ_op", 0.0) > 0.5:
+        vuln_offset -= 0.50
+    if raw_metrics.get("has_tetrahedron", 0.0) > 0.5:
+        vuln_offset -= 0.45
+    if raw_metrics.get("has_incenter", 0.0) > 0.5:
+        vuln_offset -= 0.40
+    if raw_metrics.get("has_bisector", 0.0) > 0.5 and raw_metrics.get("is_geometry", 0.0) > 0.5:
+        vuln_offset -= (0.50 if (is_small or "low" in e_clean) else 0.20)
+    if raw_metrics.get("has_grid_board", 0.0) > 0.5 and ("medium" in e_clean or "low" in e_clean or is_small):
+        vuln_offset -= 0.40
+    if raw_metrics.get("has_alice_bob", 0.0) > 0.5 and is_small:
+        vuln_offset -= 0.35
+    if raw_metrics.get("is_geometry", 0.0) > 0.5 and plen > 800 and is_small:
+        vuln_offset -= 0.60
 
     # Final regularized meta-classifier logit
     total_logit = (
         lo_prior
-        - 0.40 * cond_norm
-        - 0.35 * len_norm
-        + 0.05
-        + 1.00 * z_tree
+        - eff_cond_penalty
+        - eff_len_penalty
+        + formal_bonus
+        + vuln_offset
+        + 1.10 * z_tree
         + 0.30 * z_cot
     )
+
     return float(total_logit)

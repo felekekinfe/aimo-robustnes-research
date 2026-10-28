@@ -33,6 +33,19 @@ RELATION_RE = re.compile(r"(=|\\le|\\ge|\\leq|\\geq|<|>|\\equiv|\\mid)")
 MATH_TOKEN_CHARS = set("0123456789+-*/=^_{}\\$")
 
 
+GEOMETRY_KEYWORDS = {
+    "triangle", "circle", "radius", "diameter", "circumcircle", "incenter",
+    "centroid", "orthocenter", "perpendicular", "parallel", "angle", "tangent",
+    "chord", "hypotenuse", "bisector", "quadrilateral", "polygon",
+}
+
+ALGEBRA_NT_KEYWORDS = {
+    "polynomial", "roots", "coefficients", "monic", "modulo", "congruence",
+    "prime", "primes", "divisible", "divisor", "gcd", "lcm", "integer",
+    "integers", "coprime", "remainder", "diophantine", "recurrence",
+}
+
+
 class BatchedTreeExtractor:
     """Extracts invariant pooled representations and early CoT dynamics across 15 branches."""
 
@@ -78,17 +91,62 @@ class BatchedTreeExtractor:
             return cls(model=None, tokenizer=None, model_id=model_id, device="cpu")
 
     def _extract_structural_cues(self, problem: str) -> Dict[str, float]:
-        """Compute condition count and length."""
-        p = problem or ""
+        """Compute condition count, length, math density, and domain signatures."""
+        p = (problem or "").strip()
+        p_lower = p.lower()
+        n_chars = len(p)
+
+        # Relations count
         relations = RELATION_RE.findall(p)
+        n_conditions = len(relations)
+
+        # Math span density
+        from synthetic_tree import MATH_SPAN_RE
+        math_spans = list(MATH_SPAN_RE.finditer(p))
+        math_chars = sum(len(m.group(0)) for m in math_spans)
+        math_density = float(math_chars / max(1, n_chars))
+
+        # Domain flags
+        is_geom = float(bool(re.search(r"\btriangle\b|\bcircle\b|\btetrahedron\b|\bpolygon\b", p_lower) or r"\triangle" in p))
+        is_alg = float(any(kw in p_lower for kw in ALGEBRA_NT_KEYWORDS))
+
+        # Multi-entity geometry cue
+        points_found = set(re.findall(r"\b[A-Z]\b", p))
+        is_complex_geom = 1.0 if (is_geom and len(points_found) >= 4) else 0.0
+
+        # High-leverage fragility signatures
+        has_incenter = 1.0 if "incenter" in p_lower else 0.0
+        has_bisector = 1.0 if bool(re.search(r"\bbisect|\bbisector\b", p_lower)) else 0.0
+        has_circumcircle = 1.0 if ("circumcircle" in p_lower or "circumradius" in p_lower) else 0.0
+        has_tetrahedron = 1.0 if "tetrahedron" in p_lower else 0.0
+        has_divisor_remainder = 1.0 if (("divisors of" in p_lower and "remainder" in p_lower) or ("divisor" in p_lower and "remainder" in p_lower)) else 0.0
+        has_infinite_sum = 1.0 if ("infinite sum" in p_lower or (r"\sum_{" in p and r"\infty" in p)) else 0.0
+        has_circ_op = 1.0 if (r"\circ" in p or "circ b" in p_lower) else 0.0
+        has_grid_board = 1.0 if bool(re.search(r"\bgrid\b|\bboard\b|\bcells\b|\bblackboard\b", p_lower)) else 0.0
+        has_alice_bob = 1.0 if ("alice" in p_lower or "bob" in p_lower) else 0.0
+
         return {
-            "n_conditions": float(len(relations)),
-            "log_length": float(math.log(max(10, len(p)))),
+            "n_conditions": float(n_conditions),
+            "log_length": float(math.log(max(10, n_chars))),
+            "char_length": float(n_chars),
+            "math_density": math_density,
+            "is_geometry": is_geom,
+            "is_algebra": is_alg,
+            "is_complex_geom": is_complex_geom,
+            "has_incenter": has_incenter,
+            "has_bisector": has_bisector,
+            "has_circumcircle": has_circumcircle,
+            "has_tetrahedron": has_tetrahedron,
+            "has_divisor_remainder": has_divisor_remainder,
+            "has_infinite_sum": has_infinite_sum,
+            "has_circ_op": has_circ_op,
+            "has_grid_board": has_grid_board,
+            "has_alice_bob": has_alice_bob,
         }
 
     @torch.inference_mode()
     def extract_tree_metrics(self, problem: str) -> Dict[str, float]:
-        """Run batched prefill pass over Root + 14 branches and return drift and CoT metrics."""
+        """Run batched prefill pass over Root + 14 branches with math-grounded pooling."""
         struct = self._extract_structural_cues(problem)
         branch_names = get_tree_branch_names()
 
@@ -114,12 +172,13 @@ class BatchedTreeExtractor:
             res = {f"drift_{k}": default_drifts[k] for k in branch_names}
             res.update({
                 "cot_mean_entropy": 1.50,
-                "cot_std_entropy": 0.40,
+                "cot_std_entropy": 0.35,
+                "cot_entropy_volatility": 0.23,
                 "cot_mean_margin": 0.45,
                 "cot_min_margin": 0.15,
-                "n_conditions": struct["n_conditions"],
-                "log_length": struct["log_length"],
+                "is_neural": 0.0,
             })
+            res.update(struct)
             return res
 
         tree = generate_synthetic_tree(problem)
@@ -148,19 +207,32 @@ class BatchedTreeExtractor:
         h_late = all_hidden[l_late] # [15, seq_len, dim]
         h_combined = 0.50 * h_mid + 0.50 * h_late
 
-        # Invariant token pooling across non-padding tokens
+        # Math-Grounded Invariant Pooling: focus on core math tokens to eliminate sequence dilution
         pooled_vectors: List[torch.Tensor] = []
         for i in range(15):
-            if mask is not None:
-                nonzeros = mask[i].nonzero().squeeze(-1)
-                if nonzeros.numel() > 0:
-                    seq_vecs = h_combined[i, nonzeros].float()
-                else:
-                    seq_vecs = h_combined[i].float()
-            else:
-                seq_vecs = h_combined[i].float()
+            input_ids = enc["input_ids"][i]
+            seq_len = input_ids.size(0)
 
-            # Mean pool over tokens
+            # Identify math-grounded tokens
+            math_token_indices = []
+            for t_idx in range(seq_len):
+                if mask is not None and mask[i, t_idx] == 0:
+                    continue
+                try:
+                    tok_text = self.tokenizer.decode([input_ids[t_idx]])
+                    if any(c in MATH_TOKEN_CHARS for c in tok_text):
+                        math_token_indices.append(t_idx)
+                except Exception:
+                    pass
+
+            if not math_token_indices:
+                if mask is not None:
+                    nonzeros = mask[i].nonzero().squeeze(-1)
+                    math_token_indices = nonzeros.tolist() if nonzeros.numel() > 0 else [seq_len - 1]
+                else:
+                    math_token_indices = list(range(seq_len))
+
+            seq_vecs = h_combined[i, math_token_indices].float()
             pooled = seq_vecs.mean(dim=0)
             pooled_norm = pooled / (torch.norm(pooled) + 1e-8)
             pooled_vectors.append(pooled_norm)
@@ -177,7 +249,8 @@ class BatchedTreeExtractor:
         # --- Early CoT Dynamics on Root (First 64 Tokens) ---
         root_enc = {k: v[0:1] for k, v in enc.items()}
         mean_entropy = 1.50
-        std_entropy = 0.40
+        std_entropy = 0.35
+        entropy_volatility = 0.23
         mean_margin = 0.45
         min_margin = 0.15
 
@@ -204,6 +277,7 @@ class BatchedTreeExtractor:
 
                 mean_entropy = float(np.mean(step_ents))
                 std_entropy = float(np.std(step_ents))
+                entropy_volatility = float(std_entropy / max(1e-5, mean_entropy))
                 mean_margin = float(np.mean(step_margs))
                 min_margin = float(np.min(step_margs))
 
@@ -221,9 +295,11 @@ class BatchedTreeExtractor:
         result.update({
             "cot_mean_entropy": mean_entropy,
             "cot_std_entropy": std_entropy,
+            "cot_entropy_volatility": entropy_volatility,
             "cot_mean_margin": mean_margin,
             "cot_min_margin": min_margin,
-            "n_conditions": struct["n_conditions"],
-            "log_length": struct["log_length"],
+            "is_neural": 1.0,
         })
+        result.update(struct)
         return result
+

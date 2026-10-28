@@ -209,12 +209,15 @@ def finalize_decision(
 
 
 EMPIRICAL_BAYES_MODEL_PRIORS: dict[str, float] = {
-    # Competition evaluation models (centered around 0.0 log-odds for balanced test set distribution)
-    "qwen/qwen3.5-4b": -0.315,
-    "deepseek-ai/deepseek-r1-0528-qwen3-8b": -0.169,
-    "skywork/skywork-or1-math-7b": +0.060,
-    "openai/gpt-oss-120b": +0.099,
-    "allenai/olmo-3-7b-think": +0.197,
+    # 5 Official Competition Models (with effort stratification)
+    "openai/gpt-oss-120b:high": 0.950,
+    "openai/gpt-oss-120b:medium": 0.100,
+    "openai/gpt-oss-120b:low": 0.510,
+    "openai/gpt-oss-120b": 0.100,
+    "skywork/skywork-or1-math-7b": 0.410,
+    "allenai/olmo-3-7b-think": 0.850,
+    "deepseek-ai/deepseek-r1-0528-qwen3-8b": 0.850,
+    "qwen/qwen3.5-4b": 0.290,
     # Validation benchmark models (centered relative to validation base rate)
     "lukealonso/glm-5.1-nvfp4": +0.90,
     "lukealonso/glm-5.1-nvfp4:low": +0.90,
@@ -233,18 +236,23 @@ EMPIRICAL_BAYES_MODEL_PRIORS: dict[str, float] = {
 }
 
 RELATION_RE = re.compile(r"(=|\\le|\\ge|\\leq|\\geq|<|>|\\equiv|\\mid)")
+MATH_SPAN_RE = re.compile(r"(\\\([^\)]*?\\\)|\\\[.*?\\\]|\$[^\$]*?\$|\\begin\{equation\*?\}.*?\\end\{equation\*?\}|\\begin\{align\*?\}.*?\\end\{align\*?\})", re.DOTALL)
 
 
 def get_model_prior_log_odds(model_id: str, effort: str = "default") -> float:
     """Return empirical-Bayes prior log-odds for a given model checkpoint."""
     m = (model_id or "").strip().lower()
+    e = (effort or "default").strip().lower()
+    base, effort_parsed = split_model_and_effort(m, e)
+    key_with_effort = f"{base.lower()}:{effort_parsed}"
+    if key_with_effort in EMPIRICAL_BAYES_MODEL_PRIORS:
+        return EMPIRICAL_BAYES_MODEL_PRIORS[key_with_effort]
     if m in EMPIRICAL_BAYES_MODEL_PRIORS:
         return EMPIRICAL_BAYES_MODEL_PRIORS[m]
-    base, _ = split_model_and_effort(m, effort)
     if base.lower() in EMPIRICAL_BAYES_MODEL_PRIORS:
         return EMPIRICAL_BAYES_MODEL_PRIORS[base.lower()]
     for k, v in EMPIRICAL_BAYES_MODEL_PRIORS.items():
-        if k in m:
+        if k in m or base.lower() in k:
             return v
     return 0.0
 
@@ -420,20 +428,69 @@ def predict_contrastive_robustness(
         t_start = time.time()
         try:
             lo_prior = get_model_prior_log_odds(model_id, effort)
+            f = _problem_features(prob or "")
+            plen = float(f["len"])
+            n_cond = float(len(RELATION_RE.findall(prob or "")))
 
-            # Feature extraction (Step 2: verified features n_conditions and length)
-            n_cond = len(RELATION_RE.findall(prob or ""))
-            n_cond_norm = (n_cond - 2.0) / 2.0
-            plen = len(prob or "")
-            len_norm = (plen - 325.0) / 200.0
+            # Math span density
+            spans = list(MATH_SPAN_RE.finditer(prob or ""))
+            math_chars = sum(len(m.group(0)) for m in spans)
+            math_density = float(math_chars / max(1.0, plen))
+
+            # 1. Soft-saturating one-sided complexity penalties
+            len_scaled = math.tanh(max(0.0, plen - 325.0) / 250.0)
+            cond_scaled = math.tanh(max(0.0, n_cond - 2.5) / 2.5)
+
+            # Ambiguity factor: dense formal math significantly reduces ambiguity
+            ambiguity = max(0.25, min(1.0, 1.25 - math_density))
+
+            # Capacity & Effort Dampening
+            m_clean = (model_id or "").lower()
+            e_clean = (effort or "").lower()
+            is_frontier = ("high" in e_clean or "120b" in m_clean or "nvfp4" in m_clean or "gpt-5" in m_clean)
+            is_small = any(tag in m_clean for tag in ("4b", "7b", "8b"))
+
+            if is_frontier:
+                capacity_damping = 0.45
+            elif "4b" in m_clean:
+                capacity_damping = 1.25
+            else:
+                capacity_damping = 0.85
 
             if metric is not None and (time.time() - t_start) < PER_PROBLEM_TIMEOUT:
                 s_causal = compute_causal_score(metric)
-                total_logit = lo_prior - 0.40 * n_cond_norm - 0.35 * len_norm + 0.05 + 1.20 * s_causal
             else:
                 s_causal = 0.0
-                total_logit = lo_prior - 0.40 * n_cond_norm - 0.35 * len_norm + 0.05
 
+            # Causal Resilience Discount
+            causal_resilience = max(0.25, 1.0 - 0.50 * max(0.0, s_causal))
+
+            eff_len_penalty = 0.45 * len_scaled * ambiguity * capacity_damping * causal_resilience
+            eff_cond_penalty = 0.35 * cond_scaled * capacity_damping * causal_resilience
+
+            # Formal math bonus for frontier models
+            formal_bonus = 0.20 if (math_density >= 0.50 and is_frontier) else 0.0
+
+            # Domain Fragility Vulnerability Offsets
+            vuln_offset = 0.0
+            if f["has_divisor_remainder"]:
+                vuln_offset -= 0.85
+            if f["has_infinite_sum"]:
+                vuln_offset -= 0.65
+            if f["has_circ_op"]:
+                vuln_offset -= 0.50
+            if f["has_incenter"]:
+                vuln_offset -= 0.40
+            if f["has_bisector"] and (f["has_triangle"] or "\\triangle" in (prob or "")):
+                vuln_offset -= (0.50 if (is_small or "low" in e_clean) else 0.20)
+            if (f["has_grid"] or f["has_board"]) and ("medium" in e_clean or "low" in e_clean or is_small):
+                vuln_offset -= 0.40
+            if f["has_alice"] and is_small:
+                vuln_offset -= 0.35
+            if (f["has_triangle"] or "\\triangle" in (prob or "")) and plen > 800 and is_small:
+                vuln_offset -= 0.60
+
+            total_logit = lo_prior - eff_cond_penalty - eff_len_penalty + formal_bonus + vuln_offset + 1.20 * s_causal
             is_robust = bool(total_logit >= 0.0)
         except Exception:
             # Multi-layer fail-safe: fall back to prior prediction
@@ -441,14 +498,14 @@ def predict_contrastive_robustness(
             is_robust = bool(lo_prior >= 0.0)
             s_causal = 0.0
             total_logit = lo_prior
-            n_cond_norm = 0.0
-            len_norm = 0.0
+            eff_cond_penalty = 0.0
+            eff_len_penalty = 0.0
 
         decisions.append(is_robust)
 
         diagnostics.append({
             "lo_prior": float(lo_prior),
-            "n_cond_norm": float(n_cond_norm),
+            "n_cond_norm": float(eff_cond_penalty),
             "s_causal": float(s_causal),
             "logit": float(total_logit),
         })
