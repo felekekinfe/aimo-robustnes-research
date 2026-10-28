@@ -78,23 +78,30 @@ def evaluate_single_problem(
     prior_log_odds: float,
     reasoning_effort: str = "default",
 ) -> bool:
-    """Score an individual problem independently via the Synthetic Tree Blueprint."""
+    """Score an individual problem independently via SCSP and Synthetic Tree Blueprint."""
     t_start = time.time()
     try:
-        raw_metrics = extractor.extract_tree_metrics(problem)
-        stratified = evaluate_stratified_metrics(raw_metrics)
-        logit = compute_tree_decision_logit(
+        if extractor.model is not None and extractor.tokenizer is not None:
+            from scsp_core import SelfCalibratingSpectralProbe, compute_scsp_robustness_logit
+            probe = SelfCalibratingSpectralProbe(extractor.tokenizer, extractor.model, device=extractor.device)
+            feat = probe.extract_features(problem)
+            _, is_robust = compute_scsp_robustness_logit(
+                problem_text=problem,
+                model_id=model_id,
+                reasoning_effort=reasoning_effort,
+                whitebox_features=feat,
+            )
+            return bool(is_robust)
+
+        # Structural / Prior fallback via SCSP
+        from scsp_core import compute_scsp_robustness_logit
+        _, is_robust = compute_scsp_robustness_logit(
+            problem_text=problem,
             model_id=model_id,
-            raw_metrics=raw_metrics,
-            stratified_metrics=stratified,
             reasoning_effort=reasoning_effort,
+            whitebox_features=None,
         )
-
-        # Timeout guard
-        if (time.time() - t_start) > PER_PROBLEM_TIMEOUT:
-            return bool(prior_log_odds >= 0.0)
-
-        return bool(logit >= 0.0)
+        return bool(is_robust)
     except Exception as e:
         logger.warning("Error evaluating problem: %s. Using prior fallback.", e)
         return bool(prior_log_odds >= 0.0)

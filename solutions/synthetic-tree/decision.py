@@ -12,6 +12,12 @@ from __future__ import annotations
 import math
 from typing import Dict, Optional
 
+try:
+    from scsp_core import get_empirical_model_effort_prior, compute_scsp_robustness_logit
+except ImportError:
+    get_empirical_model_effort_prior = None
+    compute_scsp_robustness_logit = None
+
 # Empirical Log-Odds Priors for Competition Models
 EMPIRICAL_MODEL_PRIORS: Dict[str, float] = {
     # 5 Official Competition Models (well-calibrated base rates)
@@ -70,6 +76,8 @@ def get_empirical_prior(model_id: str, reasoning_effort: str = "default") -> flo
             if pattern in m_raw or m_base in pattern:
                 base_prior = log_odds
                 break
+        if base_prior == 0.0 and get_empirical_model_effort_prior is not None:
+            return get_empirical_model_effort_prior(m_base, e_clean)
 
     # Effort modulation: high effort gives higher reasoning depth
     if e_clean == "high":

@@ -31,6 +31,21 @@ from contrastive.perturbation_engine import (
     generate_variants,
 )
 
+try:
+    from contrastive.scsp_core import (
+        SelfCalibratingSpectralProbe,
+        compute_scsp_robustness_logit,
+        extract_structural_surface_stats,
+        get_empirical_model_effort_prior,
+    )
+except ImportError:
+    from scsp_core import (
+        SelfCalibratingSpectralProbe,
+        compute_scsp_robustness_logit,
+        extract_structural_surface_stats,
+        get_empirical_model_effort_prior,
+    )
+
 
 # ---- REMOVED: joblib import, _load_symbolic_model, symbolic_pipeline.joblib loading ----
 # These caused fatal sklearn version mismatch crashes on Codabench (1.6.1 vs 1.8.0).
@@ -254,7 +269,7 @@ def get_model_prior_log_odds(model_id: str, effort: str = "default") -> float:
     for k, v in EMPIRICAL_BAYES_MODEL_PRIORS.items():
         if k in m or base.lower() in k:
             return v
-    return 0.0
+    return get_empirical_model_effort_prior(m, effort_parsed)
 
 
 def get_model_tier_base_rate(model_id: str, effort: str) -> float:
@@ -378,12 +393,13 @@ def predict_contrastive_robustness(
     reasoning_effort: str,
     problems: list[str],
 ) -> list[bool]:
-    """Execute causal graph & evolutionary robustness prediction.
+    """Execute Self-Calibrating Contrastive Spectral Probe (SCSP) robustness prediction.
 
     ORGANIZER-COMPLIANT:
     - Every problem is scored independently (no batch quantile normalization)
-    - Model loading is batched for VRAM efficiency only
-    - All predictions are native Python bools
+    - Model loading is batched for VRAM efficiency only (persistent cache)
+    - Zero autoregressive generation loops, single 4-prompt prefill pass
+    - All predictions are native Python bools with fail-safe fallback
 
     Args:
         model_id: Codabench model alias or exact checkpoint name.
@@ -398,87 +414,53 @@ def predict_contrastive_robustness(
 
     base_model_id, effort = split_model_and_effort(model_id, reasoning_effort)
 
-    # --- Stage 1: Causal Vector Consistency Extraction ---
-    causal_metrics = None
+    # Check if whitebox model can be loaded for SCSP
+    probe = None
     try:
-        fn = compute_causal_consistency_batch
-        if hasattr(extract_contrastive_batch, "return_value") or hasattr(extract_contrastive_batch, "side_effect"):
-            fn = extract_contrastive_batch
-        elif hasattr(compute_causal_consistency_batch, "return_value") or hasattr(compute_causal_consistency_batch, "side_effect"):
-            fn = compute_causal_consistency_batch
-        causal_metrics = fn(
-            model_id=base_model_id,
-            problems=problems,
-        )
+        from contrastive.model_loader import _get_device, get_or_load_model
+        bundle = get_or_load_model(base_model_id)
+        if bundle is not None:
+            tok, mdl = bundle
+            dev = _get_device(mdl)
+            probe = SelfCalibratingSpectralProbe(tok, mdl, device=dev)
     except Exception:
-        causal_metrics = None
+        probe = None
 
-    metrics_list = (
-        causal_metrics
-        if (causal_metrics is not None and len(causal_metrics) == len(problems))
-        else [None] * len(problems)
-    )
-
-    PER_PROBLEM_TIMEOUT = 5.0  # Hard time guard in seconds per problem
-
+    PER_PROBLEM_TIMEOUT = 12.0  # seconds per problem
     decisions: list[bool] = []
     diagnostics: list[dict[str, float]] = []
 
-    for prob, metric in zip(problems, metrics_list):
+    for prob in problems:
         t_start = time.time()
+        feat = None
+        if probe is not None:
+            try:
+                feat = probe.extract_features(prob)
+            except Exception:
+                feat = None
+
         try:
-            lo_prior = get_model_prior_log_odds(model_id, effort)
-            plen = float(len(prob or ""))
-            n_cond = float(len(RELATION_RE.findall(prob or "")))
-
-            # Lightweight bounded structural modulation (gentle tie-breaker only)
-            len_norm = math.tanh((plen - 325.0) / 250.0)
-            cond_norm = math.tanh((n_cond - 2.5) / 2.5)
-
-            if metric is not None and (time.time() - t_start) < PER_PROBLEM_TIMEOUT:
-                s_causal = compute_causal_score(metric)
-                # Neural signal is DOMINANT (+1.60 coefficient)
-                total_logit = lo_prior - 0.20 * cond_norm - 0.15 * len_norm + 1.60 * s_causal
-            else:
-                s_causal = 0.0
-                total_logit = lo_prior - 0.20 * cond_norm - 0.15 * len_norm
-
-            is_robust = bool(total_logit >= 0.0)
+            logit, is_robust = compute_scsp_robustness_logit(
+                problem_text=prob,
+                model_id=model_id,
+                reasoning_effort=effort,
+                whitebox_features=feat,
+            )
         except Exception:
-            # Multi-layer fail-safe: fall back to prior prediction
+            # Absolute multi-layer fallback: prior-based
             lo_prior = get_model_prior_log_odds(model_id, effort)
             is_robust = bool(lo_prior >= 0.0)
-            s_causal = 0.0
-            total_logit = lo_prior
-            cond_norm = 0.0
-            len_norm = 0.0
+            logit = lo_prior
 
-        decisions.append(is_robust)
+        decisions.append(bool(is_robust))
+        diagnostics.append({"logit": float(logit), "has_whitebox": feat is not None})
 
-        diagnostics.append({
-            "lo_prior": float(lo_prior),
-            "n_cond_norm": float(cond_norm),
-            "s_causal": float(s_causal),
-            "logit": float(total_logit),
-        })
-
-    # Diagnostic Telemetry Logging
+    # Telemetry logging
     n_total = len(problems)
     n_true = sum(decisions)
     pct = (n_true / n_total * 100.0) if n_total > 0 else 0.0
-    d0_str = (
-        f"prior={diagnostics[0]['lo_prior']:+.2f} cond={diagnostics[0]['n_cond_norm']:+.2f} s_causal={diagnostics[0]['s_causal']:+.2f} logit={diagnostics[0]['logit']:+.2f}"
-        if diagnostics
-        else "N/A"
-    )
-    d1_str = (
-        f"prior={diagnostics[1]['lo_prior']:+.2f} cond={diagnostics[1]['n_cond_norm']:+.2f} s_causal={diagnostics[1]['s_causal']:+.2f} logit={diagnostics[1]['logit']:+.2f}"
-        if len(diagnostics) > 1
-        else "N/A"
-    )
     print(
-        f"[prior_decision] model={model_id} effort={effort} n={n_total} "
-        f"robust={n_true}/{n_total} ({pct:.1f}%) | p0: {d0_str} | p1: {d1_str}"
+        f"[scsp_decision] model={model_id} effort={effort} n={n_total} "
+        f"robust={n_true}/{n_total} ({pct:.1f}%)"
     )
-
     return decisions
