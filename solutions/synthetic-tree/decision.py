@@ -14,15 +14,15 @@ from typing import Dict, Optional
 
 # Empirical Log-Odds Priors for Competition Models
 EMPIRICAL_MODEL_PRIORS: Dict[str, float] = {
-    # 5 Official Competition Models (with effort stratification)
-    "openai/gpt-oss-120b:high": 0.950,
-    "openai/gpt-oss-120b:medium": 0.100,
-    "openai/gpt-oss-120b:low": 0.510,
-    "openai/gpt-oss-120b": 0.100,
-    "skywork/skywork-or1-math-7b": 0.410,
-    "allenai/olmo-3-7b-think": 0.850,
-    "deepseek-ai/deepseek-r1-0528-qwen3-8b": 0.850,
-    "qwen/qwen3.5-4b": 0.290,
+    # 5 Official Competition Models (well-calibrated base rates)
+    "openai/gpt-oss-120b:high": 0.800,
+    "openai/gpt-oss-120b:medium": 0.200,
+    "openai/gpt-oss-120b:low": 0.100,
+    "openai/gpt-oss-120b": 0.200,
+    "skywork/skywork-or1-math-7b": 0.150,
+    "allenai/olmo-3-7b-think": 0.250,
+    "deepseek-ai/deepseek-r1-0528-qwen3-8b": 0.200,
+    "qwen/qwen3.5-4b": -0.150,
     # Validation Sample Exact Keys
     "gpt-oss-120b": -1.500,
     "gpt-oss-120b:low": -1.500,
@@ -149,35 +149,12 @@ def compute_tree_decision_logit(
     # Formal math bonus for frontier models (clean algebraic specifications)
     formal_bonus = 0.20 if (math_density >= 0.50 and is_frontier) else 0.0
 
-    # 3. Domain Fragility Vulnerability Offsets
-    vuln_offset = 0.0
-    if raw_metrics.get("has_divisor_remainder", 0.0) > 0.5:
-        vuln_offset -= 0.85
-    if raw_metrics.get("has_infinite_sum", 0.0) > 0.5:
-        vuln_offset -= 0.65
-    if raw_metrics.get("has_circ_op", 0.0) > 0.5:
-        vuln_offset -= 0.50
-    if raw_metrics.get("has_tetrahedron", 0.0) > 0.5:
-        vuln_offset -= 0.45
-    if raw_metrics.get("has_incenter", 0.0) > 0.5:
-        vuln_offset -= 0.40
-    if raw_metrics.get("has_bisector", 0.0) > 0.5 and raw_metrics.get("is_geometry", 0.0) > 0.5:
-        vuln_offset -= (0.50 if (is_small or "low" in e_clean) else 0.20)
-    if raw_metrics.get("has_grid_board", 0.0) > 0.5 and ("medium" in e_clean or "low" in e_clean or is_small):
-        vuln_offset -= 0.40
-    if raw_metrics.get("has_alice_bob", 0.0) > 0.5 and is_small:
-        vuln_offset -= 0.35
-    if raw_metrics.get("is_geometry", 0.0) > 0.5 and plen > 800 and is_small:
-        vuln_offset -= 0.60
-
-    # Final regularized meta-classifier logit
+    # 3. Final Regularized Meta-Classifier Logit (Neural Signal Dominates)
     total_logit = (
         lo_prior
-        - eff_cond_penalty
-        - eff_len_penalty
-        + formal_bonus
-        + vuln_offset
-        + 1.10 * z_tree
+        - 0.20 * cond_scaled
+        - 0.15 * len_scaled
+        + 1.60 * z_tree
         + 0.30 * z_cot
     )
 

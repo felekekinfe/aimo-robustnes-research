@@ -29,7 +29,7 @@ from stratified_engine import evaluate_stratified_metrics
 logger = logging.getLogger("AIMO-Synthetic-Tree-Solver")
 
 OVERSIZED_OR_CLOSED_TAGS = (
-    "gemini", "gpt-5", "claude", "397b", "405b", "671b", "frontier"
+    "gemini", "gpt-5", "claude", "397b", "405b", "671b", "120b", "gpt-oss", "frontier"
 )
 
 PER_PROBLEM_TIMEOUT = 12.0  # seconds
