@@ -21,7 +21,7 @@ except ImportError:
     HAS_TORCH_TRANSFORMERS = False
 
 OVERSIZED_TAGS = (
-    "32b", "70b", "72b", "110b", "120b", "235b", "397b", "405b", "671b", "gpt-oss", "frontier"
+    "70b", "72b", "110b", "235b", "397b", "405b", "671b", "frontier", "gemini", "gpt-5", "claude"
 )
 
 SAFE_OFFLINE_PROXIES = (
@@ -65,6 +65,16 @@ def unload_current_model() -> None:
 def _is_oversized_model(model_id: str) -> bool:
     """Check if model exceeds safe single-GPU VRAM (prevents CPU offload + SIGKILL 137)."""
     m = (model_id or "").lower()
+    # openai/gpt-oss-120b is cached in MXFP4 form (62 GiB) and runs natively only on >=80GB GPUs (e.g. Codabench 96GB RTX 6000)
+    if "gpt-oss-120b" in m or "120b" in m:
+        if HAS_TORCH_TRANSFORMERS and torch.cuda.is_available():
+            try:
+                vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                if vram_gb >= 80.0:
+                    return False
+            except Exception:
+                pass
+        return True
     if any(tag in m for tag in OVERSIZED_TAGS):
         return True
     try:
@@ -72,7 +82,7 @@ def _is_oversized_model(model_id: str) -> bool:
         cfg = AutoConfig.from_pretrained(model_id, local_files_only=True)
         h = getattr(cfg, "hidden_size", 0)
         L = getattr(cfg, "num_hidden_layers", 0)
-        if h * L > 200_000:
+        if h * L > 250_000:
             return True
     except Exception:
         pass

@@ -426,11 +426,18 @@ def predict_contrastive_robustness(
     except Exception:
         probe = None
 
+    legacy_metrics = None
+    if probe is None:
+        try:
+            legacy_metrics = extract_contrastive_batch(base_model_id, problems)
+        except Exception:
+            legacy_metrics = None
+
     PER_PROBLEM_TIMEOUT = 12.0  # seconds per problem
     decisions: list[bool] = []
     diagnostics: list[dict[str, float]] = []
 
-    for prob in problems:
+    for i, prob in enumerate(problems):
         t_start = time.time()
         feat = None
         if probe is not None:
@@ -438,6 +445,8 @@ def predict_contrastive_robustness(
                 feat = probe.extract_features(prob)
             except Exception:
                 feat = None
+        elif legacy_metrics is not None and i < len(legacy_metrics) and legacy_metrics[i] is not None:
+            feat = {"neural_score": compute_causal_score(legacy_metrics[i])}
 
         try:
             logit, is_robust = compute_scsp_robustness_logit(

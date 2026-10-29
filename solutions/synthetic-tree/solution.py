@@ -29,7 +29,7 @@ from stratified_engine import evaluate_stratified_metrics
 logger = logging.getLogger("AIMO-Synthetic-Tree-Solver")
 
 OVERSIZED_OR_CLOSED_TAGS = (
-    "gemini", "gpt-5", "claude", "397b", "405b", "671b", "120b", "gpt-oss", "frontier"
+    "gemini", "gpt-5", "claude", "397b", "405b", "671b", "frontier"
 )
 
 PER_PROBLEM_TIMEOUT = 12.0  # seconds
@@ -42,6 +42,8 @@ _CACHED_EXTRACTOR: Optional[BatchedTreeExtractor] = None
 def _is_unsupported_model(model_id: str) -> bool:
     """Identify models that cannot or should not be loaded on single GPU."""
     m_clean = (model_id or "").split(":")[0].strip().lower()
+    if "gpt-oss-120b" in m_clean or "120b" in m_clean:
+        return False
     return any(tag in m_clean for tag in OVERSIZED_OR_CLOSED_TAGS)
 
 
