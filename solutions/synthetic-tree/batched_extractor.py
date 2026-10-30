@@ -77,9 +77,13 @@ class BatchedTreeExtractor:
             if tokenizer.pad_token is None:
                 tokenizer.pad_token = tokenizer.eos_token or tokenizer.bos_token or "<unk>"
 
+            dtype = "auto" if "gpt-oss-120b" in model_id.lower() else (
+                torch.bfloat16 if (actual_device == "cuda" and torch.cuda.is_bf16_supported())
+                else (torch.float16 if actual_device == "cuda" else torch.float32)
+            )
             model = AutoModelForCausalLM.from_pretrained(
                 model_id,
-                torch_dtype=torch.float16 if actual_device == "cuda" else torch.float32,
+                torch_dtype=dtype,
                 device_map="auto" if actual_device == "cuda" else None,
                 local_files_only=True,
                 trust_remote_code=True,

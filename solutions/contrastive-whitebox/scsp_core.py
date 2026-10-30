@@ -206,14 +206,15 @@ class SelfCalibratingSpectralProbe:
         return float(np.clip(0.5 * (kl_pm + kl_qm) / math.log(2.0), 0.0, 1.0))
 
     @staticmethod
-    def _compute_spectral_rank(h_tokens: torch.Tensor) -> float:
+    def _compute_spectral_and_stable_rank(h_tokens: torch.Tensor) -> Tuple[float, float]:
         """
-        Normalized spectral entropy of the token Gram matrix in [0, 1].
-        Centered around ~0.60 on Olympiad problems.
+        Computes both:
+        1. Normalized spectral entropy of the token Gram matrix in [0, 1] (centered around ~0.60).
+        2. Stable Rank ||H||_F^2 / ||H||_2^2 normalized by sqrt(T).
         """
         h = h_tokens.float()
         if h.ndim != 2 or h.size(0) < 4:
-            return 0.58
+            return 0.58, 0.50
         # Subsample up to 256 tokens evenly to keep Gram matrix eigvalsh O(1) (< 1ms)
         if h.size(0) > 256:
             idx = torch.linspace(0, h.size(0) - 1, steps=256, device=h.device).long()
@@ -226,7 +227,12 @@ class SelfCalibratingSpectralProbe:
         probs = eigvals / eigvals.sum()
         entropy = -torch.sum(probs * torch.log(probs)).item()
         max_ent = math.log(float(h.size(0)))
-        return float(np.clip(entropy / max(max_ent, 1.0), 0.0, 1.0))
+        spectral_rank = float(np.clip(entropy / max(max_ent, 1.0), 0.0, 1.0))
+
+        # Stable rank = sum(sigma_i^2) / sigma_max^2 = sum(eigvals) / max(eigvals)
+        srank_raw = float((eigvals.sum() / eigvals[-1]).item())
+        stable_rank = float(np.clip(srank_raw / math.sqrt(float(h.size(0))), 0.0, 1.0))
+        return spectral_rank, stable_rank
 
     @torch.no_grad()
     def extract_features(self, problem_text: str) -> Dict[str, float]:
@@ -256,11 +262,18 @@ class SelfCalibratingSpectralProbe:
         late_h = hidden_states[idx_late]
         final_h = hidden_states[idx_final]
 
-        # 1. Intrinsic Spectral Rank on clean prompt tokens
+        # 1. Intrinsic Spectral Rank & Stable Rank on clean prompt tokens
         clean_mask = inputs["attention_mask"][0].bool()
-        spectral_rank = self._compute_spectral_rank(mid_h[0, clean_mask, :])
+        spectral_rank, stable_rank = self._compute_spectral_and_stable_rank(mid_h[0, clean_mask, :])
 
-        # 2. Whitened (All-but-the-Top Mean Subtracted) Latent Drift over final 8 tokens
+        # 2. Layer-wise velocity between mid (0.55L) and late (0.82L) layers
+        layer_vel = 1.0 - F.cosine_similarity(
+            mid_h[0, clean_mask, :].float().mean(dim=0),
+            late_h[0, clean_mask, :].float().mean(dim=0),
+            dim=0,
+        ).item()
+
+        # 3. Whitened (All-but-the-Top Mean Subtracted) Latent Drift over final 8 tokens
         w_window = min(8, late_h.size(1))
         cone_late = late_h[0, clean_mask, :].float().mean(dim=0, keepdim=True)
         cone_final = final_h[0, clean_mask, :].float().mean(dim=0, keepdim=True)
@@ -283,7 +296,7 @@ class SelfCalibratingSpectralProbe:
         # Self-Centered Contrastive Discrimination Index in [-1, +1]
         cdi_latent = (d_dest - d_pres) / (d_dest + d_pres + 1e-5)
 
-        # 3. Forced-Answer Digit Distribution JSD & Epistemic Margin
+        # 4. Forced-Answer Digit Distribution JSD & Epistemic Margin
         logits_last = outputs.logits[:, -1, :].float()
         digit_logits = logits_last[:, self.digit_token_ids]
         digit_probs = F.softmax(digit_logits, dim=-1)
@@ -309,6 +322,8 @@ class SelfCalibratingSpectralProbe:
             "premise_sensitivity": float(jsd_dest),
             "preserve_drift": float(d_pres),
             "spectral_rank": float(spectral_rank),
+            "stable_rank": float(stable_rank),
+            "layer_velocity": float(np.clip(layer_vel, 0.0, 2.0)),
             "digit_margin": float(digit_margin),
             "structural_complexity": surf["structural_complexity"],
         }
